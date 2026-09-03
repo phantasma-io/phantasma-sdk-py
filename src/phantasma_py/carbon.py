@@ -16,11 +16,14 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
-from typing import Any, ClassVar, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Self, TypeVar, cast
 
 from .crypto import Address, AddressKind, PhantasmaKeys
 from .encoding import decode_hex
 from .errors import BuilderError, CryptoError, SerializationError
+
+if TYPE_CHECKING:
+    from .fees import PlanAndSignOptions
 
 
 class CarbonSerializable(Protocol):
@@ -2306,59 +2309,189 @@ def _witness_slots(msg: TxMsg, addresses: list[Bytes32]) -> list[tuple[Bytes32, 
     return slots
 
 
-@dataclass(slots=True)
-class FeeOptions:
-    gas_fee_base: int = 10_000
-    fee_multiplier: int = 1_000
+@dataclass(slots=True, frozen=True)
+class TxLimits:
+    """The explicit transaction limits a builder writes into the message.
 
-    def calculate_max_gas(self, count: int = 1) -> int:
-        count = _parse_positive_count(count, "FeeOptions.calculate_max_gas")
-        return self.gas_fee_base * self.fee_multiplier * count
+    Builders carry no prices: a message built without max_gas has a zero gas offer, which marks it
+    as not yet planned - plan it with PhantasmaRPC.fees.plan / plan_fees before signing, or pass
+    the offer here.
+    """
 
-
-@dataclass(slots=True)
-class CreateTokenFeeOptions(FeeOptions):
-    gas_fee_base: int = 10_000
-    fee_multiplier: int = 10_000
-    gas_fee_create_token_base: int = 10_000_000_000
-    gas_fee_create_token_symbol: int = 10_000_000_000
-
-    def calculate_max_gas_for_symbol(self, symbol: SmallString) -> int:
-        shift = max(len(symbol.value.encode("utf-8")) - 1, 0)
-        symbol_part = self.gas_fee_create_token_symbol >> shift if shift < 64 else 0
-        return (self.gas_fee_base + self.gas_fee_create_token_base + symbol_part) * self.fee_multiplier
+    #: The gas offer in kcal-base (TxMsg.max_gas). 0 = unplanned.
+    max_gas: int = 0
+    #: The storage-escrow ceiling in data-token atoms (TxMsg.max_data).
+    max_data: int = 0
+    #: The expiry as a millisecond timestamp (TxMsg.expiry). 0 = DEFAULT_TX_EXPIRY_MS from now. A
+    #: flow with a person in it - a hardware wallet confirming, a wallet-link round trip - should
+    #: set this from the chain's own window instead; see expiry_within.
+    expiry: int = 0
 
 
-@dataclass(slots=True)
-class CreateSeriesFeeOptions(FeeOptions):
-    gas_fee_base: int = 10_000
-    fee_multiplier: int = 10_000
-    gas_fee_create_series_base: int = 2_500_000_000
-
-    def calculate_max_gas(self, count: int = 1) -> int:
-        count = _parse_positive_count(count, "CreateSeriesFeeOptions.calculate_max_gas")
-        if count != 1:
-            raise ValueError("CreateSeriesFeeOptions.calculate_max_gas is not count-sensitive; count must be 1")
-        return (self.gas_fee_base + self.gas_fee_create_series_base) * self.fee_multiplier
+#: The default lifetime of a message a builder stamps, in milliseconds.
+#:
+#: The chain reads the expiry in milliseconds and refuses anything at or beyond now + expiryWindow,
+#: where expiryWindow is a chain setting whose node default is 60,000 ms. A default has to hold on
+#: the shortest window a chain may run, and it is compared against the NODE's clock, so it also has
+#: to survive the two clocks disagreeing - hence a quarter of a minute of headroom rather than the
+#: whole minute. Chains that allow longer report it as expiryWindow in getGasConfig, reachable as
+#: PhantasmaRPC.fees.chain_params().
+DEFAULT_TX_EXPIRY_MS = 45_000
 
 
-@dataclass(slots=True)
-class MintNFTFeeOptions(FeeOptions):
-    def calculate_max_gas(self, count_or_tokens: int | Sequence[Any] = 1) -> int:
-        count = _parse_mint_count(count_or_tokens, "MintNFTFeeOptions.calculate_max_gas")
-        return self.gas_fee_base * self.fee_multiplier * count
+def default_expiry() -> int:
+    """The expiry for a message built to be signed and sent now."""
+    return now_unix_millis() + DEFAULT_TX_EXPIRY_MS
 
 
-def _parse_positive_count(value: object, method_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{method_name} count must be a positive integer")
-    return value
+def expiry_within(expiry_window_ms: int, margin_ms: int = 0) -> int:
+    """The latest expiry a chain with this window will still admit, less a margin for the clock the
+    node compares it against. Use it when a person sits between building a transaction and signing
+    it: the chain's window is usually far longer than DEFAULT_TX_EXPIRY_MS, and the whole of it is
+    available.
+
+    expiry_window_ms is the chain's window, from PhantasmaRPC.fees.chain_params(). margin_ms is the
+    headroom for clock skew and the trip to the node; 0 means 5 seconds.
+    """
+    if expiry_window_ms <= 0:
+        raise BuilderError("expiry_within: expiry_window_ms must be positive")
+    if margin_ms < 0:
+        raise BuilderError("expiry_within: margin_ms must not be negative")
+    margin = margin_ms or 5_000
+    lifetime = expiry_window_ms - margin
+    if lifetime <= 0:
+        raise BuilderError(f"expiry_within: a margin of {margin} ms leaves nothing of a {expiry_window_ms} ms window")
+    return now_unix_millis() + lifetime
 
 
-def _parse_mint_count(value: int | Sequence[Any], method_name: str) -> int:
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return _parse_positive_count(len(value), method_name)
-    return _parse_positive_count(value, method_name)
+def _apply_tx_limits(msg: TxMsg, limits: TxLimits | None) -> TxMsg:
+    # Writes the limits into a message the builders assemble.
+    limits = limits or TxLimits()
+    msg.max_gas = limits.max_gas
+    msg.max_data = limits.max_data
+    msg.expiry = limits.expiry or default_expiry()
+    return msg
+
+
+def _native_tx(tx_type: TxType, gas_from: Bytes32, limits: TxLimits | None, msg: TxPayload) -> TxMsg:
+    return _apply_tx_limits(TxMsg(tx_type, 0, 0, 0, gas_from, SmallString(""), msg), limits)
+
+
+# The native transaction types come in pairs: the plain form, where the account moving the tokens
+# also pays the gas and signs alone, and the gas-payer form, where a second account pays the gas and
+# both sign. Naming a gas payer selects the second form. The builders assemble the message only:
+# fees are planned afterwards from the message itself (PhantasmaRPC.fees.plan, plan_fees) and the
+# witnesses sign with sign_tx_msg / sign_tx_msg_with. Unless a max_gas is passed the message carries
+# a zero offer and cannot be signed until it is planned.
+
+
+def build_transfer_fungible_tx(
+    *,
+    from_address: Bytes32,
+    to: Bytes32,
+    token_id: int,
+    amount: int,
+    gas_payer: Bytes32 | None = None,
+    limits: TxLimits | None = None,
+) -> TxMsg:
+    """Builds a fungible transfer: the plain type, or the gas-payer type when a gas payer is named.
+
+    from_address is the account whose tokens move (always a witness); gas_payer is a different
+    account that pays the gas and becomes the first witness (None = the sender pays); amount is in
+    the token's atoms (u64; big-fungible tokens need a script transfer).
+    """
+    if gas_payer is not None:
+        return _native_tx(
+            TxType.TRANSFER_FUNGIBLE_GAS_PAYER,
+            gas_payer,
+            limits,
+            TxMsgTransferFungibleGasPayer(to, from_address, token_id, amount),
+        )
+    return _native_tx(TxType.TRANSFER_FUNGIBLE, from_address, limits, TxMsgTransferFungible(to, token_id, amount))
+
+
+def build_transfer_non_fungible_tx(
+    *,
+    from_address: Bytes32,
+    to: Bytes32,
+    token_id: int,
+    instance_ids: Sequence[int],
+    gas_payer: Bytes32 | None = None,
+    limits: TxLimits | None = None,
+) -> TxMsg:
+    """Builds an NFT transfer: the single- or multi-instance type by the instance count, in the
+    plain or the gas-payer form."""
+    ids = list(instance_ids)
+    if not ids:
+        raise BuilderError("instance_ids must not be empty")
+    single = len(ids) == 1
+    if gas_payer is not None:
+        if single:
+            return _native_tx(
+                TxType.TRANSFER_NON_FUNGIBLE_SINGLE_GAS_PAYER,
+                gas_payer,
+                limits,
+                TxMsgTransferNonFungibleSingleGasPayer(to, from_address, token_id, ids[0]),
+            )
+        return _native_tx(
+            TxType.TRANSFER_NON_FUNGIBLE_MULTI_GAS_PAYER,
+            gas_payer,
+            limits,
+            TxMsgTransferNonFungibleMultiGasPayer(to, from_address, token_id, ids),
+        )
+    if single:
+        return _native_tx(
+            TxType.TRANSFER_NON_FUNGIBLE_SINGLE,
+            from_address,
+            limits,
+            TxMsgTransferNonFungibleSingle(to, token_id, ids[0]),
+        )
+    return _native_tx(
+        TxType.TRANSFER_NON_FUNGIBLE_MULTI, from_address, limits, TxMsgTransferNonFungibleMulti(to, token_id, ids)
+    )
+
+
+def build_mint_fungible_tx(
+    *, owner: Bytes32, to: Bytes32, token_id: int, amount: IntX, limits: TxLimits | None = None
+) -> TxMsg:
+    """Builds a fungible mint, paid and signed by the token owner. Mint and burn carry an IntX
+    because they also serve big-fungible tokens, whose balances do not fit a u64."""
+    return _native_tx(TxType.MINT_FUNGIBLE, owner, limits, TxMsgMintFungible(token_id, to, amount))
+
+
+def build_burn_fungible_tx(
+    *,
+    from_address: Bytes32,
+    token_id: int,
+    amount: IntX,
+    gas_payer: Bytes32 | None = None,
+    limits: TxLimits | None = None,
+) -> TxMsg:
+    """Builds a fungible burn in the plain or the gas-payer form."""
+    if gas_payer is not None:
+        return _native_tx(
+            TxType.BURN_FUNGIBLE_GAS_PAYER, gas_payer, limits, TxMsgBurnFungibleGasPayer(token_id, from_address, amount)
+        )
+    return _native_tx(TxType.BURN_FUNGIBLE, from_address, limits, TxMsgBurnFungible(token_id, amount))
+
+
+def build_burn_non_fungible_tx(
+    *,
+    from_address: Bytes32,
+    token_id: int,
+    instance_id: int,
+    gas_payer: Bytes32 | None = None,
+    limits: TxLimits | None = None,
+) -> TxMsg:
+    """Builds an NFT burn in the plain or the gas-payer form."""
+    if gas_payer is not None:
+        return _native_tx(
+            TxType.BURN_NON_FUNGIBLE_GAS_PAYER,
+            gas_payer,
+            limits,
+            TxMsgBurnNonFungibleGasPayer(token_id, from_address, instance_id),
+        )
+    return _native_tx(TxType.BURN_NON_FUNGIBLE, from_address, limits, TxMsgBurnNonFungible(token_id, instance_id))
 
 
 def now_unix_millis() -> int:
@@ -2534,80 +2667,65 @@ def build_phantasma_nft_rom(nft_rom_schema: VMStructSchema, metadata: list[tuple
     return _write_dynamic_struct_with_schema(VMDynamicStruct(fields), public_schema)
 
 
-def build_create_token_tx(
-    token_info: TokenInfo,
-    creator: Bytes32,
-    fees: CreateTokenFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
-) -> TxMsg:
-    fees = fees or CreateTokenFeeOptions()
-    return TxMsg(
-        TxType.CALL,
-        expiry or now_unix_millis() + 60 * 1000,
-        fees.calculate_max_gas_for_symbol(token_info.symbol),
-        max_data,
-        creator,
-        SmallString(""),
-        TxMsgCall(ModuleID.TOKEN, TokenContractMethod.CREATE_TOKEN, serialize(token_info)),
-    )
+def _call_tx(gas_from: Bytes32, limits: TxLimits | None, call: TxMsgCall) -> TxMsg:
+    return _apply_tx_limits(TxMsg(TxType.CALL, 0, 0, 0, gas_from, SmallString(""), call), limits)
+
+
+def build_create_token_tx(token_info: TokenInfo, creator: Bytes32, limits: TxLimits | None = None) -> TxMsg:
+    """Builds a CreateToken call. The message carries the limits given and nothing else: plan its
+    fees from the message before signing, or pass the offer in limits."""
+    return _call_tx(creator, limits, TxMsgCall(ModuleID.TOKEN, TokenContractMethod.CREATE_TOKEN, serialize(token_info)))
 
 
 def build_create_token_tx_and_sign(
     token_info: TokenInfo,
     signer: PhantasmaKeys,
-    fees: CreateTokenFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> bytes:
+    """Builds a CreateToken call, plans it against config - unless options.limits fixes the offer -
+    and signs it with the creator's keys. See plan_and_sign_with_keys."""
+    from .fees import PlanAndSignOptions, plan_and_sign_with_keys
+
+    options = options or PlanAndSignOptions()
     creator = bytes32_from_public_key(signer.public_key)
-    return sign_and_serialize_tx_msg(build_create_token_tx(token_info, creator, fees, max_data, expiry), signer)
+    return plan_and_sign_with_keys(
+        build_create_token_tx(token_info, creator, options.limits), [signer], config, options
+    )
 
 
 def build_create_token_tx_and_sign_hex(
     token_info: TokenInfo,
     signer: PhantasmaKeys,
-    fees: CreateTokenFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> str:
-    return build_create_token_tx_and_sign(token_info, signer, fees, max_data, expiry).hex()
+    return build_create_token_tx_and_sign(token_info, signer, config, options).hex()
 
 
 def build_create_token_series_tx(
-    token_id: int,
-    series_info: SeriesInfo,
-    creator: Bytes32,
-    fees: CreateSeriesFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    token_id: int, series_info: SeriesInfo, creator: Bytes32, limits: TxLimits | None = None
 ) -> TxMsg:
-    fees = fees or CreateSeriesFeeOptions()
+    """Builds a CreateTokenSeries call with the limits given; see build_create_token_tx."""
     writer = CarbonWriter()
     writer.write8u(token_id)
     series_info.write_carbon(writer)
-    return TxMsg(
-        TxType.CALL,
-        expiry or now_unix_millis() + 60 * 1000,
-        fees.calculate_max_gas(),
-        max_data,
-        creator,
-        SmallString(""),
-        TxMsgCall(ModuleID.TOKEN, TokenContractMethod.CREATE_TOKEN_SERIES, writer.bytes()),
-    )
+    return _call_tx(creator, limits, TxMsgCall(ModuleID.TOKEN, TokenContractMethod.CREATE_TOKEN_SERIES, writer.bytes()))
 
 
 def build_create_token_series_tx_and_sign(
     token_id: int,
     series_info: SeriesInfo,
     signer: PhantasmaKeys,
-    fees: CreateSeriesFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> bytes:
+    from .fees import PlanAndSignOptions, plan_and_sign_with_keys
+
+    options = options or PlanAndSignOptions()
     creator = bytes32_from_public_key(signer.public_key)
-    return sign_and_serialize_tx_msg(
-        build_create_token_series_tx(token_id, series_info, creator, fees, max_data, expiry), signer
+    return plan_and_sign_with_keys(
+        build_create_token_series_tx(token_id, series_info, creator, options.limits), [signer], config, options
     )
 
 
@@ -2615,67 +2733,10 @@ def build_create_token_series_tx_and_sign_hex(
     token_id: int,
     series_info: SeriesInfo,
     signer: PhantasmaKeys,
-    fees: CreateSeriesFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> str:
-    return build_create_token_series_tx_and_sign(token_id, series_info, signer, fees, max_data, expiry).hex()
-
-
-def build_mint_non_fungible_tx(
-    token_id: int,
-    series_id: int,
-    sender: Bytes32,
-    receiver: Bytes32,
-    rom: bytes,
-    ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
-) -> TxMsg:
-    fees = fees or MintNFTFeeOptions()
-    return TxMsg(
-        TxType.MINT_NON_FUNGIBLE,
-        expiry or now_unix_millis() + 60 * 1000,
-        fees.calculate_max_gas(),
-        max_data,
-        sender,
-        SmallString(""),
-        TxMsgMintNonFungible(token_id, receiver, series_id, rom, ram),
-    )
-
-
-def build_mint_non_fungible_tx_and_sign(
-    token_id: int,
-    series_id: int,
-    signer: PhantasmaKeys,
-    receiver: Bytes32,
-    rom: bytes,
-    ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
-) -> bytes:
-    sender = bytes32_from_public_key(signer.public_key)
-    return sign_and_serialize_tx_msg(
-        build_mint_non_fungible_tx(token_id, series_id, sender, receiver, rom, ram, fees, max_data, expiry), signer
-    )
-
-
-def build_mint_non_fungible_tx_and_sign_hex(
-    token_id: int,
-    series_id: int,
-    signer: PhantasmaKeys,
-    receiver: Bytes32,
-    rom: bytes,
-    ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
-) -> str:
-    return build_mint_non_fungible_tx_and_sign(
-        token_id, series_id, signer, receiver, rom, ram, fees, max_data, expiry
-    ).hex()
+    return build_create_token_series_tx_and_sign(token_id, series_info, signer, config, options).hex()
 
 
 def build_mint_phantasma_non_fungible_tx(
@@ -2683,21 +2744,18 @@ def build_mint_phantasma_non_fungible_tx(
     sender: Bytes32,
     receiver: Bytes32,
     tokens: Sequence[PhantasmaNFTMintInfo],
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    limits: TxLimits | None = None,
 ) -> TxMsg:
-    fees = fees or MintNFTFeeOptions()
+    """Builds a deterministic Phantasma NFT mint of one or more instances with the limits given; see
+    build_create_token_tx. Phantasma NFTs are minted through this call only: the native
+    MintNonFungible message exists for the chain's own use, and the SDK builds no transaction for
+    it."""
     token_list = list(tokens)
+    if not token_list:
+        raise BuilderError("MintPhantasmaNonFungible needs at least one instance")
     args = MintPhantasmaNonFungibleArgs(token_id, receiver, token_list)
-    return TxMsg(
-        TxType.CALL,
-        expiry or now_unix_millis() + 60 * 1000,
-        fees.calculate_max_gas(token_list),
-        max_data,
-        sender,
-        SmallString(""),
-        TxMsgCall(ModuleID.TOKEN, TokenContractMethod.MINT_PHANTASMA_NON_FUNGIBLE, serialize(args)),
+    return _call_tx(
+        sender, limits, TxMsgCall(ModuleID.TOKEN, TokenContractMethod.MINT_PHANTASMA_NON_FUNGIBLE, serialize(args))
     )
 
 
@@ -2706,13 +2764,18 @@ def build_mint_phantasma_non_fungible_tx_and_sign(
     signer: PhantasmaKeys,
     receiver: Bytes32,
     tokens: Sequence[PhantasmaNFTMintInfo],
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> bytes:
+    from .fees import PlanAndSignOptions, plan_and_sign_with_keys
+
+    options = options or PlanAndSignOptions()
     sender = bytes32_from_public_key(signer.public_key)
-    return sign_and_serialize_tx_msg(
-        build_mint_phantasma_non_fungible_tx(token_id, sender, receiver, tokens, fees, max_data, expiry), signer
+    return plan_and_sign_with_keys(
+        build_mint_phantasma_non_fungible_tx(token_id, sender, receiver, tokens, options.limits),
+        [signer],
+        config,
+        options,
     )
 
 
@@ -2721,13 +2784,10 @@ def build_mint_phantasma_non_fungible_tx_and_sign_hex(
     signer: PhantasmaKeys,
     receiver: Bytes32,
     tokens: Sequence[PhantasmaNFTMintInfo],
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> str:
-    return build_mint_phantasma_non_fungible_tx_and_sign(
-        token_id, signer, receiver, tokens, fees, max_data, expiry
-    ).hex()
+    return build_mint_phantasma_non_fungible_tx_and_sign(token_id, signer, receiver, tokens, config, options).hex()
 
 
 def build_mint_phantasma_non_fungible_single_tx(
@@ -2737,19 +2797,11 @@ def build_mint_phantasma_non_fungible_single_tx(
     receiver: Bytes32,
     public_rom: bytes,
     ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    limits: TxLimits | None = None,
 ) -> TxMsg:
     phantasma_series_id = _require_required_int("phantasma_series_id", phantasma_series_id)
     return build_mint_phantasma_non_fungible_tx(
-        token_id,
-        sender,
-        receiver,
-        [PhantasmaNFTMintInfo(IntX(phantasma_series_id), public_rom, ram)],
-        fees,
-        max_data,
-        expiry,
+        token_id, sender, receiver, [PhantasmaNFTMintInfo(IntX(phantasma_series_id), public_rom, ram)], limits
     )
 
 
@@ -2760,16 +2812,20 @@ def build_mint_phantasma_non_fungible_single_tx_and_sign(
     receiver: Bytes32,
     public_rom: bytes,
     ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> bytes:
+    from .fees import PlanAndSignOptions, plan_and_sign_with_keys
+
+    options = options or PlanAndSignOptions()
     sender = bytes32_from_public_key(signer.public_key)
-    return sign_and_serialize_tx_msg(
+    return plan_and_sign_with_keys(
         build_mint_phantasma_non_fungible_single_tx(
-            token_id, phantasma_series_id, sender, receiver, public_rom, ram, fees, max_data, expiry
+            token_id, phantasma_series_id, sender, receiver, public_rom, ram, options.limits
         ),
-        signer,
+        [signer],
+        config,
+        options,
     )
 
 
@@ -2780,12 +2836,11 @@ def build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
     receiver: Bytes32,
     public_rom: bytes,
     ram: bytes = b"",
-    fees: MintNFTFeeOptions | None = None,
-    max_data: int = 100_000_000,
-    expiry: int = 0,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
 ) -> str:
     return build_mint_phantasma_non_fungible_single_tx_and_sign(
-        token_id, phantasma_series_id, signer, receiver, public_rom, ram, fees, max_data, expiry
+        token_id, phantasma_series_id, signer, receiver, public_rom, ram, config, options
     ).hex()
 
 

@@ -4,6 +4,7 @@ reproducing the chain's own settlement arithmetic and the gas each contract path
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -20,6 +21,7 @@ from .carbon import (
     TokenContractMethod,
     TokenFlags,
     TokenInfo,
+    TxLimits,
     TxMsg,
     TxMsgBurnFungible,
     TxMsgBurnFungibleGasPayer,
@@ -43,7 +45,9 @@ from .carbon import (
     envelope_bytes,
     is_nft_address,
     required_witnesses,
+    sign_and_serialize_tx_msg,
 )
+from .crypto import PhantasmaKeys
 from .errors import BuilderError
 
 
@@ -952,3 +956,45 @@ def _instance_count(length: int) -> int:
     if length < 1:
         raise BuilderError("plan_fees: the message must carry at least one instance")
     return length
+
+
+@dataclass(slots=True)
+class PlanAndSignOptions:
+    """The options of the build_*_tx_and_sign conveniences: how to plan the fee, or what to write
+    instead."""
+
+    #: The facts the plan cannot read from the message; see FeePlanOptions.
+    facts: FeePlanOptions = field(default_factory=FeePlanOptions)
+    #: The limits the builder writes into the message. A nonzero max_gas fixes the offer and skips
+    #: planning; see TxLimits.
+    limits: TxLimits = field(default_factory=TxLimits)
+
+
+def plan_and_sign_with_keys(
+    msg: TxMsg,
+    keys: Sequence[PhantasmaKeys],
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
+) -> bytes:
+    """Plans a freshly built message against config - unless the caller fixed max_gas themselves -
+    and signs it with in-memory keys. The convenience behind every build_*_tx_and_sign helper; a
+    wallet with an external signer plans with plan_fees and signs with sign_tx_msg_with."""
+    options = options or PlanAndSignOptions()
+    # Whether the fee is already settled is read from the MESSAGE: the builders are what write the
+    # caller's limits into it, so the message is the one place that is right for every helper. The
+    # same rule as PhantasmaRPC.send_transaction.
+    if msg.max_gas != 0:
+        return sign_and_serialize_tx_msg(msg, *keys)
+    if config is None:
+        raise BuilderError(
+            "plan_and_sign: a message without a gas offer needs the chain's gas config to plan it: "
+            "pass the config, or fix max_gas in the limits"
+        )
+    # Only the witness-array types take their witness count from the caller, and these keys are
+    # that caller's answer; for every other type the message fixes its own slots and one key may
+    # fill two of them, so passing a count would contradict the message.
+    facts = dataclasses.replace(options.facts)
+    if required_witnesses(msg) is None and facts.witness_count is None:
+        facts.witness_count = len(keys)
+    plan = plan_fees(msg, config, facts)
+    return sign_and_serialize_tx_msg(plan.apply(msg), *keys)

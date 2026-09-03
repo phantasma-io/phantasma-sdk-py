@@ -44,7 +44,7 @@ rom = build_nft_rom(
 
 ## Token Builders
 
-Token helper functions create Carbon payloads in validator wire order:
+Token helper functions create Carbon payloads in the chain's wire order:
 
 - `build_token_info`
 - `build_series_info`
@@ -52,10 +52,21 @@ Token helper functions create Carbon payloads in validator wire order:
 - `build_create_token_tx_and_sign`
 - `build_create_token_series_tx`
 - `build_create_token_series_tx_and_sign`
-- `build_mint_non_fungible_tx`
-- `build_mint_non_fungible_tx_and_sign`
 - `build_mint_phantasma_non_fungible_tx`
 - `build_mint_phantasma_non_fungible_tx_and_sign`
+
+The native transaction types have builders too: `build_transfer_fungible_tx`,
+`build_transfer_non_fungible_tx`, `build_mint_fungible_tx`,
+`build_burn_fungible_tx` and `build_burn_non_fungible_tx`; naming a `gas_payer`
+selects the gas-payer form, where a second account pays the gas and both sign.
+Phantasma NFTs are minted through `build_mint_phantasma_non_fungible_tx` only:
+the native `MintNonFungible` message exists for the chain's own use.
+
+Builders carry no prices. They write only the `TxLimits` you pass; a message
+built without `max_gas` has a zero offer, which marks it as unplanned and
+refuses to sign - plan it from the message (see `docs/rpc.md`) or state the
+offer. The `*_and_sign` helpers plan the message against a `GasConfig` before
+signing unless `PlanAndSignOptions.limits` fixes the offer.
 
 They are safe constructors: malformed symbols, missing metadata, invalid icon
 data URIs, and wrong schema field names raise explicit SDK errors.

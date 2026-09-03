@@ -6,23 +6,22 @@ import pytest
 from phantasma_py.carbon import (
     Bytes32,
     ChainConfig,
-    CreateSeriesFeeOptions,
-    CreateTokenFeeOptions,
     GasConfig,
     IntX,
     MarketConfig,
     MarketConfigFlags,
     MarketSellTokenByIDArgs,
-    MintNFTFeeOptions,
     MintPhantasmaNonFungibleArgs,
     PhantasmaNFTMintInfo,
     SmallString,
     TokenListing,
     TokensConfig,
     TokensConfigFlags,
+    TxLimits,
     TxMsg,
     TxMsgBurnFungibleGasPayer,
     TxMsgMintFungible,
+    TxMsgMintNonFungible,
     TxMsgTransferFungible,
     TxMsgTransferFungibleGasPayer,
     TxType,
@@ -31,10 +30,9 @@ from phantasma_py.carbon import (
     build_and_serialize_token_schemas,
     build_create_token_series_tx,
     build_create_token_tx,
-    build_mint_non_fungible_tx,
-    build_mint_non_fungible_tx_and_sign,
-    build_mint_non_fungible_tx_and_sign_hex,
     build_mint_phantasma_non_fungible_single_tx,
+    build_mint_phantasma_non_fungible_single_tx_and_sign,
+    build_mint_phantasma_non_fungible_single_tx_and_sign_hex,
     build_nft_rom,
     build_phantasma_nft_rom,
     build_series_info,
@@ -52,6 +50,7 @@ from phantasma_py.carbon import (
 )
 from phantasma_py.crypto import PhantasmaKeys
 from phantasma_py.errors import BuilderError
+from phantasma_py.fees import PlanAndSignOptions
 
 CARBON_TX_BUILDER_FIXTURE_SHA256 = "efcb2d237ffd2ca3178b8c3b3106c7d035bc0f5e05959abb135163d637c3b11d"
 
@@ -318,9 +317,7 @@ def _carbon_tx_builder_vector(case_id: str) -> str:
                 build_create_token_tx(
                     token_info,
                     sender_bytes,
-                    CreateTokenFeeOptions(),
-                    100_000_000,
-                    1_759_711_416_000,
+                    TxLimits(max_gas=106_250_100_000_000, max_data=100_000_000, expiry=1_759_711_416_000),
                 )
             )
             .hex()
@@ -334,9 +331,7 @@ def _carbon_tx_builder_vector(case_id: str) -> str:
                     (1 << 64) - 1,
                     series_info,
                     sender_bytes,
-                    CreateSeriesFeeOptions(),
-                    100_000_000,
-                    1_759_711_416_000,
+                    TxLimits(max_gas=25_000_100_000_000, max_data=100_000_000, expiry=1_759_711_416_000),
                 )
             )
             .hex()
@@ -345,18 +340,18 @@ def _carbon_tx_builder_vector(case_id: str) -> str:
     schemas = prepare_standard_token_schemas(False)
     if case_id == "mint_non_fungible_u256_nft_id":
         rom = build_nft_rom(schemas.rom, (1 << 256) - 1, sample_nft_metadata(include_nested_rom=True))
+        # The native MintNonFungible message is the chain's own; the SDK builds no transaction for
+        # it, so the vector spells the message out.
         return (
             serialize(
-                build_mint_non_fungible_tx(
-                    (1 << 64) - 1,
-                    (1 << 32) - 1,
-                    sender_bytes,
-                    sender_bytes,
-                    rom,
-                    b"",
-                    MintNFTFeeOptions(),
-                    100_000_000,
+                TxMsg(
+                    TxType.MINT_NON_FUNGIBLE,
                     1_759_711_416_000,
+                    10_000_000,
+                    100_000_000,
+                    sender_bytes,
+                    SmallString(""),
+                    TxMsgMintNonFungible((1 << 64) - 1, sender_bytes, (1 << 32) - 1, rom, b""),
                 )
             )
             .hex()
@@ -373,9 +368,7 @@ def _carbon_tx_builder_vector(case_id: str) -> str:
                     receiver_bytes,
                     public_rom,
                     b"",
-                    MintNFTFeeOptions(),
-                    123,
-                    1_759_711_416_000,
+                    TxLimits(max_gas=10_000_000, max_data=123, expiry=1_759_711_416_000),
                 )
             )
             .hex()
@@ -393,25 +386,10 @@ def test_mint_nft_signing_hex_helper_matches_raw_helper() -> None:
     receiver = bytes32_from_public_key(
         PhantasmaKeys.from_wif("KwVG94yjfVg1YKFyRxAGtug93wdRbmLnqqrFV6Yd2CiA9KZDAp4H").public_key
     )
-    raw = build_mint_non_fungible_tx_and_sign(
-        9,
-        7,
-        keys,
-        receiver,
-        b"\xaa",
-        fees=MintNFTFeeOptions(),
-        max_data=0,
-        expiry=1_759_711_416_000,
-    )
-    encoded = build_mint_non_fungible_tx_and_sign_hex(
-        9,
-        7,
-        keys,
-        receiver,
-        b"\xaa",
-        fees=MintNFTFeeOptions(),
-        max_data=0,
-        expiry=1_759_711_416_000,
+    options = PlanAndSignOptions(limits=TxLimits(max_gas=10_000_000, max_data=0, expiry=1_759_711_416_000))
+    raw = build_mint_phantasma_non_fungible_single_tx_and_sign(9, 7, keys, receiver, b"\xaa", b"", None, options)
+    encoded = build_mint_phantasma_non_fungible_single_tx_and_sign_hex(
+        9, 7, keys, receiver, b"\xaa", b"", None, options
     )
     assert encoded == raw.hex()
 

@@ -25,6 +25,7 @@ from phantasma_py.carbon import (
     PhantasmaNFTMintInfo,
     RegisterNameArgs,
     SmallString,
+    TxLimits,
     TxMsg,
     TxMsgBurnNonFungible,
     TxMsgCall,
@@ -110,12 +111,12 @@ def create_token(symbol: str, is_nft: bool, extra: dict[str, str] | None = None)
         metadata=build_token_metadata(fields),
         token_schemas=build_and_serialize_token_schemas() if is_nft else b"",
     )
-    return build_create_token_tx(info, CREATOR, None, 0, EXPIRY)
+    return build_create_token_tx(info, CREATOR, TxLimits(expiry=EXPIRY))
 
 
 def phantasma_mint(series_ids: list[int], rom_bytes: int, to: Bytes32) -> TxMsg:
     tokens = [PhantasmaNFTMintInfo(IntX(series), bytes([7]) * rom_bytes, b"") for series in series_ids]
-    return build_mint_phantasma_non_fungible_tx(9, CREATOR, to, tokens, None, 0, EXPIRY)
+    return build_mint_phantasma_non_fungible_tx(9, CREATOR, to, tokens, TxLimits(expiry=EXPIRY))
 
 
 def block_data(plan: FeePlan) -> int:
@@ -214,7 +215,7 @@ def test_reads_a_token_creation_out_of_its_call() -> None:
 # state passed through.
 def test_reads_a_series_creation_out_of_its_call() -> None:
     info = build_series_info(5, 0, 0, CREATOR)
-    msg = build_create_token_series_tx(9, info, CREATOR, None, 0, EXPIRY)
+    msg = build_create_token_series_tx(9, info, CREATOR, TxLimits(expiry=EXPIRY))
     assert isinstance(msg.msg, TxMsgCall)
     plan = plan_fees(msg, config(), FeePlanOptions(witness_count=1, series_has_meta_id=True))
     assert plan.kind is NativeFeeKind.CREATE_TOKEN_SERIES

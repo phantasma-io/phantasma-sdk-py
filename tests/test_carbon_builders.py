@@ -6,24 +6,21 @@ from phantasma_py.carbon import (
     Bytes32,
     CarbonReader,
     CreateMintedTokenSeriesArgs,
-    CreateSeriesFeeOptions,
-    CreateTokenFeeOptions,
     CreateTokenSeriesArgs,
     IntX,
     MintFungibleArgs,
-    MintNFTFeeOptions,
     MintPhantasmaNonFungibleArgs,
     ModuleID,
     PhantasmaNFTMintInfo,
     PhantasmaNFTMintResult,
     SeriesInfo,
-    SmallString,
     TokenContractMethod,
     TokenFlags,
     TokenSchemaField,
     TokenSchemas,
     TransferFungibleArgs,
     TransferNonFungibleArgs,
+    TxLimits,
     TxMsgCall,
     TxType,
     UpdateSeriesMetadataArgs,
@@ -303,7 +300,7 @@ def test_metadata_builders_validate_schema_inputs() -> None:
     with pytest.raises(BuilderError, match="phantasma_nft_id is required"):
         build_nft_rom(schemas.rom, None, standard_nft_metadata())  # type: ignore[arg-type]
     with pytest.raises(BuilderError, match="phantasma_series_id is required"):
-        build_mint_phantasma_non_fungible_single_tx(9, None, Bytes32(), Bytes32(), b"", b"", MintNFTFeeOptions())  # type: ignore[arg-type]
+        build_mint_phantasma_non_fungible_single_tx(9, None, Bytes32(), Bytes32(), b"", b"")  # type: ignore[arg-type]
     with pytest.raises(BuilderError, match='metadata field "name" is mandatory'):
         build_nft_rom(schemas.rom, 1, [])
     with pytest.raises(BuilderError, match="incorrect case"):
@@ -388,9 +385,12 @@ def test_phantasma_nft_public_mint_rom_and_tx_helpers() -> None:
 
     sender = repeated_bytes32(0x11)
     receiver = repeated_bytes32(0x22)
-    tx = build_mint_phantasma_non_fungible_single_tx(42, 777, sender, receiver, rom, b"", MintNFTFeeOptions(), 123, 999)
+    tx = build_mint_phantasma_non_fungible_single_tx(
+        42, 777, sender, receiver, rom, b"", TxLimits(max_data=123, expiry=999)
+    )
     assert tx.type == TxType.CALL
     assert tx.expiry == 999
+    assert tx.max_gas == 0, "a builder writes no offer of its own"
     assert tx.max_data == 123
     assert tx.gas_from == sender
     assert isinstance(tx.msg, TxMsgCall)
@@ -453,42 +453,22 @@ def test_token_schema_json_helpers_match_reference_shape() -> None:
         token_schemas_from_json("""{"seriesMetadata": [], "rom": [], "ram": [{"name": "bad", "type": "Nope"}]}""")
 
 
-def test_reader_length_bounds_and_fee_defaults_match_reference_helpers() -> None:
-    # Length-prefixed result readers reject impossible allocations; fee options produce non-zero safe defaults.
+def test_reader_length_bounds_match_reference_helpers() -> None:
+    # Length-prefixed result readers reject impossible allocations.
     with pytest.raises(PhantasmaError, match="exceeds remaining bytes"):
         parse_mint_non_fungible_result(9, "FFFFFF7F")
-    assert CreateTokenFeeOptions().calculate_max_gas_for_symbol(SmallString("TOKEN")) > 0
-    assert CreateSeriesFeeOptions().calculate_max_gas() > 0
-    assert MintNFTFeeOptions().calculate_max_gas() > 0
 
 
-def test_fee_options_scale_only_count_sensitive_mint_fees() -> None:
-    assert MintNFTFeeOptions(gas_fee_base=10, fee_multiplier=1_000).calculate_max_gas(3) == 30_000
-    assert (
-        MintNFTFeeOptions(gas_fee_base=10, fee_multiplier=1_000).calculate_max_gas(
-            [PhantasmaNFTMintInfo(IntX(1), b"", b""), PhantasmaNFTMintInfo(IntX(2), b"", b"")]
-        )
-        == 20_000
-    )
-    with pytest.raises(ValueError, match="count must be a positive integer"):
-        MintNFTFeeOptions().calculate_max_gas([])
-
-    series_fees = CreateSeriesFeeOptions(gas_fee_base=10, gas_fee_create_series_base=20, fee_multiplier=30)
-    assert series_fees.calculate_max_gas() == 900
-    assert series_fees.calculate_max_gas(1) == 900
-    with pytest.raises(ValueError, match="not count-sensitive"):
-        series_fees.calculate_max_gas(2)
-
+def test_phantasma_nft_tx_helper_keeps_the_offer_given_and_refuses_an_empty_mint() -> None:
     sender = repeated_bytes32(0x11)
     receiver = repeated_bytes32(0x22)
+    limits = TxLimits(max_gas=30_000, max_data=123, expiry=999)
     tokens = [
         PhantasmaNFTMintInfo(IntX(1), b"\x01", b""),
         PhantasmaNFTMintInfo(IntX(2), b"\x02", b""),
         PhantasmaNFTMintInfo(IntX(3), b"\x03", b""),
     ]
-    tx = build_mint_phantasma_non_fungible_tx(
-        42, sender, receiver, tokens, MintNFTFeeOptions(gas_fee_base=10, fee_multiplier=1_000), 123, 999
-    )
-    assert tx.max_gas == 30_000
-    with pytest.raises(ValueError, match="count must be a positive integer"):
-        build_mint_phantasma_non_fungible_tx(42, sender, receiver, [], MintNFTFeeOptions(), 123, 999)
+    tx = build_mint_phantasma_non_fungible_tx(42, sender, receiver, tokens, limits)
+    assert (tx.max_gas, tx.max_data, tx.expiry) == (30_000, 123, 999)
+    with pytest.raises(BuilderError, match="at least one instance"):
+        build_mint_phantasma_non_fungible_tx(42, sender, receiver, [], limits)
