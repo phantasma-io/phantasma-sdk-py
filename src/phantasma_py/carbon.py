@@ -2163,19 +2163,98 @@ def envelope_bytes(msg: TxMsg, witness_count: int | None = None) -> int:
     return len(serialize(placeholders))
 
 
-def sign_tx_msg(msg: TxMsg, keys: PhantasmaKeys) -> SignedTxMsg:
-    if not isinstance(keys, PhantasmaKeys):
-        raise CryptoError("key pair is required")
-    signature = keys.sign(serialize(msg))
-    return SignedTxMsg(msg, [Witness(bytes32_from_public_key(keys.public_key), Bytes64(signature.data))])
+class TxSigner(Protocol):
+    """Produces one witness of a Carbon transaction: keys held in memory, a hardware wallet, a remote
+    signing service. Every signer signs the same serialized message, and the SDK pairs each one with
+    the envelope slot its public key owns. PhantasmaKeys satisfies it for in-memory keys."""
+
+    @property
+    def public_key(self) -> bytes:
+        """The 32-byte Ed25519 public key that becomes the witness address."""
+        ...
+
+    def sign_message(self, message: bytes) -> bytes:
+        """The raw 64-byte Ed25519 signature of the serialized message."""
+        ...
 
 
-def sign_and_serialize_tx_msg(msg: TxMsg, keys: PhantasmaKeys) -> bytes:
-    return serialize(sign_tx_msg(msg, keys))
+def sign_tx_msg(msg: TxMsg, *keys: PhantasmaKeys) -> SignedTxMsg:
+    """Signs a message with in-memory keys, one per witness the message needs.
+
+    Works for every transaction type: a gas-payer transfer takes the gas payer's and the owner's
+    keys in any order, a Call takes the keys of every witness the contract will check, in the order
+    they are to appear. See sign_tx_msg_with for other signers.
+    """
+    for key in keys:
+        if not isinstance(key, PhantasmaKeys):
+            raise CryptoError("key pair is required")
+    return sign_tx_msg_with(msg, *keys)
 
 
-def sign_and_serialize_tx_msg_hex(msg: TxMsg, keys: PhantasmaKeys) -> str:
-    return sign_and_serialize_tx_msg(msg, keys).hex()
+def sign_and_serialize_tx_msg(msg: TxMsg, *keys: PhantasmaKeys) -> bytes:
+    return serialize(sign_tx_msg(msg, *keys))
+
+
+def sign_and_serialize_tx_msg_hex(msg: TxMsg, *keys: PhantasmaKeys) -> str:
+    return sign_and_serialize_tx_msg(msg, *keys).hex()
+
+
+def sign_tx_msg_with(msg: TxMsg, *signers: TxSigner) -> SignedTxMsg:
+    """Signs a message with any TxSigners - keys, hardware wallets, remote services - one per
+    witness. Every signer signs the same serialized message; a signer that must witness twice (the
+    same account paying the gas and owning the tokens) is asked once and its signature reused."""
+    _assert_planned(msg)
+    addresses = [bytes32_from_public_key(signer.public_key) for signer in signers]
+    slots = _witness_slots(msg, addresses)
+    message = serialize(msg)
+    signatures: dict[int, Bytes64] = {}
+    witnesses: list[Witness] = []
+    for address, index in slots:
+        if index not in signatures:
+            signatures[index] = Bytes64(signers[index].sign_message(message))
+        witnesses.append(Witness(address, signatures[index]))
+    return SignedTxMsg(msg, witnesses)
+
+
+def sign_and_serialize_tx_msg_with(msg: TxMsg, *signers: TxSigner) -> bytes:
+    return serialize(sign_tx_msg_with(msg, *signers))
+
+
+def _assert_planned(msg: TxMsg) -> None:
+    # A zero gas offer is never admissible, so it marks a message that was built but not planned;
+    # signing it would only produce a rejection. Plan with PhantasmaRPC.fees / plan_fees, or set
+    # max_gas deliberately.
+    if msg.max_gas == 0:
+        raise BuilderError("transaction has no gas offer: plan its fees or set max_gas before signing")
+
+
+def _witness_slots(msg: TxMsg, addresses: list[Bytes32]) -> list[tuple[Bytes32, int]]:
+    # Pairs every witness slot of the envelope with the signer (by index) that owns its address. For
+    # the types whose witness set the node fixes (native transfers, mints, burns and their gas-payer
+    # variants) the slots come in envelope order regardless of how the signers were passed, and the
+    # signer set must match the required addresses exactly - a missing owner key or a stray extra
+    # key is a caller mistake the node would reject later at a cost. For the witness-array types the
+    # caller's order is the envelope order, and the gas payer must be among them.
+    required = required_witnesses(msg)
+    if required is None:
+        if not addresses:
+            raise BuilderError(f"{msg.type.name} transactions need at least one witness")
+        if msg.gas_from not in addresses:
+            raise BuilderError(f"the gas payer {msg.gas_from.hex()} must be one of the witnesses")
+        return [(address, index) for index, address in enumerate(addresses)]
+    if not required:
+        if addresses:
+            raise BuilderError(f"{msg.type.name} transactions carry no witnesses")
+        return []
+    slots: list[tuple[Bytes32, int]] = []
+    for address in required:
+        if address not in addresses:
+            raise BuilderError(f"no signer for witness {address.hex()}")
+        slots.append((address, addresses.index(address)))
+    for address in addresses:
+        if address not in required:
+            raise BuilderError(f"signer {address.hex()} is not a witness of this transaction")
+    return slots
 
 
 @dataclass(slots=True)

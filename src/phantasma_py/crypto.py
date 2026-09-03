@@ -256,6 +256,10 @@ class PhantasmaKeys:
     def sign(self, message: bytes) -> Ed25519Signature:
         return Ed25519Signature(self._private_object.sign(bytes(message)))
 
+    def sign_message(self, message: bytes) -> bytes:
+        """The raw 64-byte Ed25519 signature of a message; what a Carbon witness carries."""
+        return self.sign(message).data
+
     def __str__(self) -> str:
         return self.address.text
 
