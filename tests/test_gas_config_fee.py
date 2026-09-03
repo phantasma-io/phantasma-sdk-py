@@ -183,3 +183,15 @@ class TestGasConfigResultDecoding:
     def test_missing_gas_config_section_raises(self) -> None:
         with pytest.raises(RPCError):
             GasConfigResult(gas_model_version=1).to_gas_config()
+
+    # The calculator prices block data at the fixed v2 rate. A node that reports another rate
+    # would be mis-billed on the largest term of every bill, so the conversion refuses; a node
+    # that does not report the rate (an older build) converts as before.
+    def test_refuses_a_byte_price_the_sdk_does_not_implement(self) -> None:
+        broken = self.v2_result()
+        broken.units_per_block_data_byte = 26
+        with pytest.raises(RPCError, match="upgrade the SDK"):
+            broken.to_gas_config()
+        older = self.v2_result()
+        older.units_per_block_data_byte = None
+        assert older.to_gas_config().has_gas_model_v2

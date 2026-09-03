@@ -35,3 +35,8 @@ class RPCError(PhantasmaError):
 
 class BuilderError(PhantasmaError, ValueError):
     """Raised when an SDK builder cannot produce a valid payload."""
+
+
+class PreflightError(PhantasmaError):
+    """Raised for a transaction the chain would reject after charging for it, caught before signing;
+    see PhantasmaRPC.preflight_transaction."""

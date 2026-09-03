@@ -171,7 +171,15 @@ from .carbon import (
 )
 from .carbon import VMType as CarbonVMType
 from .crypto import Address, AddressKind, Ed25519Signature, Hash, PhantasmaKeys, SignatureKind
-from .errors import BuilderError, CryptoError, EncodingError, PhantasmaError, RPCError, SerializationError
+from .errors import (
+    BuilderError,
+    CryptoError,
+    EncodingError,
+    PhantasmaError,
+    PreflightError,
+    RPCError,
+    SerializationError,
+)
 from .extended_events import (
     EventData,
     EventExResult,
@@ -204,11 +212,19 @@ from .fees import (
     storage_quanta_for,
 )
 from .rpc import (
+    ADDRESS_TYPE_CARBON,
+    DEFAULT_FEE_CONFIG_TTL_SECONDS,
+    ChainFeeParams,
     EstimateTransactionResult,
+    FeePlanner,
     GasConfigDataResult,
     GasConfigResult,
     JsonRpcClient,
     PhantasmaRPC,
+    PlanRequestOptions,
+    PreflightResult,
+    PreflightVerdict,
+    SendTransactionOptions,
 )
 from .special_resolution_arguments import (
     ARGUMENT_SHAPES,
@@ -222,7 +238,9 @@ from .vm import Opcode, ScriptBuilder, VMObject, VMType
 from .vm_value import VmValue
 
 __all__ = [
+    "ADDRESS_TYPE_CARBON",
     "ARGUMENT_SHAPES",
+    "DEFAULT_FEE_CONFIG_TTL_SECONDS",
     "DEFAULT_TX_EXPIRY_MS",
     "GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE",
     "NATIVE_SIGNATURE_BYTES",
@@ -261,6 +279,7 @@ __all__ = [
     "CarbonVMType",
     "CarbonWriter",
     "ChainConfig",
+    "ChainFeeParams",
     "CreateMintedTokenSeriesArgs",
     "CreateTokenSeriesArgs",
     "CryptoError",
@@ -270,6 +289,7 @@ __all__ = [
     "EventData",
     "EventExResult",
     "FeePlan",
+    "FeePlanner",
     "FeePlanOptions",
     "FeeQuote",
     "GasConfig",
@@ -310,10 +330,15 @@ __all__ = [
     "PhantasmaNFTMintResult",
     "PhantasmaRPC",
     "PlanAndSignOptions",
+    "PlanRequestOptions",
+    "PreflightError",
+    "PreflightResult",
+    "PreflightVerdict",
     "RawArguments",
     "RegisterNameArgs",
     "RPCError",
     "ScriptBuilder",
+    "SendTransactionOptions",
     "SerializationError",
     "SeriesInfo",
     "SignatureKind",

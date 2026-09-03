@@ -6,8 +6,9 @@ import base64
 import json
 import time
 import warnings
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, fields, is_dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from enum import Enum
 from typing import Any, Generic, Protocol, TypeVar, cast, get_args, get_origin, get_type_hints
 
 import requests
@@ -16,17 +17,36 @@ from ._wire_shapes import snake_to_camel
 from .carbon import (
     Bytes32,
     GasConfig,
+    ModuleID,
     SignedTxMsg,
+    TokenContractMethod,
+    TokenInfo,
     TxMsg,
+    TxMsgBurnNonFungible,
+    TxMsgBurnNonFungibleGasPayer,
+    TxMsgCall,
+    TxSigner,
+    TxType,
+    deserialize,
+    get_nft_address,
     parse_create_token_result,
     parse_create_token_series_result,
+    required_witnesses,
     serialize,
+    sign_and_serialize_tx_msg_with,
     sign_tx_msg,
 )
 from .crypto import PhantasmaKeys
-from .errors import RPCError
+from .errors import PreflightError, RPCError
 from .extended_events import EventExResult
-from .fees import FeeQuote
+from .fees import (
+    GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE,
+    FeePlan,
+    FeePlanOptions,
+    FeeQuote,
+    InfusedAsset,
+    plan_fees,
+)
 from .transaction import Transaction, tx_state_is_fault, tx_state_is_success
 from .vm import VMObject
 from .vm_value import VmValue
@@ -311,6 +331,16 @@ class GasConfigResult:
                 raise RPCError("getGasConfig field gasDappRatioShift is missing")
             config.gas_producer_ratio_shift = data.gas_producer_ratio_shift
             config.gas_dapp_ratio_shift = data.gas_dapp_ratio_shift
+        # The calculator prices block data at the fixed v2 rate. A node that reports another rate
+        # would be under- or over-billed on the largest term of every bill, so the conversion
+        # refuses instead of pricing wrong; a node that does not report it (an older build) is
+        # taken at the rate the model was built for.
+        units = self.units_per_block_data_byte
+        if units is not None and units != GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE:
+            raise RPCError(
+                f"this node prices block data at {units} gas units per byte, this SDK implements "
+                f"{GAS_MODEL_V2_UNITS_PER_BLOCK_DATA_BYTE}: upgrade the SDK"
+            )
         return config
 
 
@@ -815,6 +845,164 @@ def _read_response_json(response: Any, max_response_bytes: int) -> Any:
     return json.loads(text)
 
 
+#: The address-type parameter value that reads account text as a Carbon address (32 bytes, hex).
+ADDRESS_TYPE_CARBON = "Carbon"
+
+#: How long a fetched gas config is reused before it is read again, in seconds. Prices change only
+#: by governance resolution, but a stale price under-offers every transaction until it is noticed,
+#: so the default is short.
+DEFAULT_FEE_CONFIG_TTL_SECONDS = 60.0
+
+
+@dataclass(slots=True, frozen=True)
+class ChainFeeParams:
+    """Chain parameters the fee flow needs that are not part of the on-chain GasConfig: they
+    describe the node's admission rules rather than its prices, and arrive in the same getGasConfig
+    answer."""
+
+    #: The longest lifetime the chain admits for a transaction, in milliseconds - it refuses an
+    #: expiry at or beyond now + expiry_window_ms. Feed it to expiry_within when a person sits
+    #: between building a transaction and signing it.
+    expiry_window_ms: int
+    #: The target time between blocks, in milliseconds.
+    block_rate_target_ms: int
+    #: The gas model the node runs: 1 = the original fee model, 2 = gas model v2.
+    gas_model_version: int
+
+
+@dataclass(slots=True)
+class PlanRequestOptions:
+    """The options of FeePlanner.plan."""
+
+    #: The facts the plan cannot read from the message; see FeePlanOptions.
+    facts: FeePlanOptions = field(default_factory=FeePlanOptions)
+    #: Reads the gas config again before planning, ignoring the cache.
+    refresh_config: bool = False
+
+
+@dataclass(slots=True)
+class SendTransactionOptions:
+    """The options of PhantasmaRPC.send_transaction."""
+
+    #: How to plan a message whose gas offer is still zero.
+    plan: PlanRequestOptions = field(default_factory=PlanRequestOptions)
+    #: Sends a token creation without asking the chain whether its symbol is taken. By default the
+    #: creation is refused unless the chain answered that the symbol is free (see
+    #: PhantasmaRPC.preflight_transaction); every other message is unaffected either way.
+    #:
+    #: The pre-flight refuses a lookup that did not answer, not only one that answered "taken": the
+    #: policy fee is spent before the contract looks at the symbol, so sending on an unestablished
+    #: state is exactly the outcome worth paying a round trip to avoid.
+    skip_preflight: bool = False
+
+
+class PreflightVerdict(Enum):
+    """What a pre-flight established."""
+
+    #: The message is not a token creation, so there is nothing to check.
+    NOT_APPLICABLE = "not-applicable"
+    #: The chain answered that the symbol is in use.
+    TAKEN = "taken"
+    #: The chain answered, through the control, that it is not.
+    FREE = "free"
+    #: The lookup did not answer. Nothing follows from it; in particular it is not free.
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True, frozen=True)
+class PreflightResult:
+    """The outcome of PhantasmaRPC.preflight_transaction."""
+
+    verdict: PreflightVerdict
+    #: What was being checked, e.g. "token symbol GPX". Empty when nothing was.
+    subject: str = ""
+    #: Why the lookup established nothing, in the node's own words. Only on UNKNOWN.
+    reason: str = ""
+
+
+@dataclass(slots=True)
+class _CachedGasConfig:
+    config: GasConfig
+    params: ChainFeeParams
+    fetched_at: float
+
+
+class FeePlanner:
+    """Plans transaction fees against one chain: reads that chain's gas config through its client,
+    keeps it for a short while, and prices messages with it. Every PhantasmaRPC owns one as
+    PhantasmaRPC.fees, so a process talking to several chains has one planner per chain and no
+    shared state."""
+
+    def __init__(
+        self,
+        client: PhantasmaRPC,
+        *,
+        config_ttl: float = DEFAULT_FEE_CONFIG_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._client = client
+        self._ttl = config_ttl if config_ttl > 0 else DEFAULT_FEE_CONFIG_TTL_SECONDS
+        self._clock = clock
+        self._cached: _CachedGasConfig | None = None
+
+    def config(self, refresh: bool = False) -> GasConfig:
+        """The chain's gas config, read from the node when the cached one is missing or expired, or
+        when refresh is set."""
+        return self._read(refresh).config
+
+    def chain_params(self, refresh: bool = False) -> ChainFeeParams:
+        """The chain's admission parameters, from the same answer and the same cache as config."""
+        return self._read(refresh).params
+
+    def invalidate(self) -> None:
+        """Forgets the cached config; the next plan reads it again."""
+        self._cached = None
+
+    def plan(self, msg: TxMsg, options: PlanRequestOptions | None = None) -> FeePlan:
+        """Plans a message against the chain's current prices. See plan_fees."""
+        options = options or PlanRequestOptions()
+        config = self.config(options.refresh_config)
+        return plan_fees(msg, config, self._with_infusions(msg, options.facts))
+
+    def plan_with(self, config: GasConfig, msg: TxMsg, options: FeePlanOptions | None = None) -> FeePlan:
+        """Plans a message against a config the caller already holds - no network, no cache."""
+        return plan_fees(msg, config, options)
+
+    def _with_infusions(self, msg: TxMsg, facts: FeePlanOptions) -> FeePlanOptions:
+        # Fills in what a burned NFT holds. A burn returns whatever the NFT's own address holds, and
+        # the chain charges for each returned asset. That set is chain state the message does not
+        # carry and has no costlier bound, so the pure planner demands it; here, with a chain to
+        # ask, it is read unless the caller stated it (an empty list states that the NFT holds
+        # nothing).
+        if facts.infusions is not None:
+            return facts
+        if not isinstance(msg.msg, TxMsgBurnNonFungible | TxMsgBurnNonFungibleGasPayer):
+            return facts
+        try:
+            infusions = self._client.infused_assets(msg.msg.token_id, msg.msg.instance_id)
+        except RPCError as exc:
+            raise RPCError(f"reading what the burned NFT holds: {exc}", code=exc.code, data=exc.data) from exc
+        return replace(facts, infusions=infusions)
+
+    def _read(self, refresh: bool) -> _CachedGasConfig:
+        now = self._clock()
+        cached = self._cached
+        if not refresh and cached is not None and now - cached.fetched_at < self._ttl:
+            return cached
+        result = self._client.get_gas_config()
+        entry = _CachedGasConfig(
+            config=result.to_gas_config(),
+            params=ChainFeeParams(
+                expiry_window_ms=result.expiry_window,
+                block_rate_target_ms=result.block_rate_target,
+                gas_model_version=result.gas_model_version,
+            ),
+            fetched_at=now,
+        )
+        self._cached = entry
+        return entry
+
+
 class JsonRpcClient:
     """Small JSON-RPC 2.0 client with strict response validation."""
 
@@ -896,6 +1084,7 @@ class PhantasmaRPC:
         timeout: float = 30.0,
         max_response_bytes: int = DEFAULT_MAX_RPC_RESPONSE_BYTES,
         api_key: str | None = None,
+        fee_config_ttl: float = DEFAULT_FEE_CONFIG_TTL_SECONDS,
     ) -> None:
         self.client = JsonRpcClient(
             endpoint,
@@ -904,6 +1093,10 @@ class PhantasmaRPC:
             max_response_bytes=max_response_bytes,
             api_key=api_key,
         )
+        #: The fee planner of the chain this client talks to: it reads the chain's gas config
+        #: through this client, caches it briefly, and prices messages with it
+        #: (client.fees.plan(msg, options)).
+        self.fees = FeePlanner(self, config_ttl=fee_config_ttl)
 
     @classmethod
     def mainnet(cls) -> PhantasmaRPC:
@@ -1509,6 +1702,164 @@ class PhantasmaRPC:
     def sign_and_send_carbon_transaction(self, msg: TxMsg, keys: PhantasmaKeys) -> str:
         return self.send_carbon_transaction(serialize(self.sign_carbon_transaction(msg, keys)))
 
+    def control_token_id(self) -> int:
+        """The gas token's id, which the pre-flight uses as its control lookup: it certainly exists
+        on any live chain. It comes from the same cached gas config the planner reads, so asking
+        costs a round trip only once a minute. An error means this client cannot read that config;
+        the pre-flight then reports unknown rather than guessing."""
+        return self.fees.config().gas_token_id
+
+    def infused_assets(self, token_id: int, instance_id: int) -> list[InfusedAsset]:
+        """What NFT instance_id of token token_id holds at its own address, in the form the fee
+        planner prices: a burn of that NFT returns every one of these to the burner and pays for
+        each. Read through the account queries with the address in its Carbon form; fungible
+        balances are resolved to token ids so the free rows of the gas and data tokens are
+        recognised. Whether the burner already holds a returned token is left at the costlier
+        reading, which moves only the escrow ceiling."""
+        address = get_nft_address(token_id, instance_id).hex()
+        assets: list[InfusedAsset] = []
+        balances = _read_all_pages(
+            lambda cursor: self.get_account_fungible_tokens(
+                address,
+                "",
+                0,
+                page_size=100,
+                cursor=cursor,
+                check_address_reserved_byte=False,
+                address_type=ADDRESS_TYPE_CARBON,
+            )
+        )
+        for balance in balances:
+            try:
+                token = self.get_token(balance.symbol, extended=False)
+            except RPCError as exc:
+                raise RPCError(
+                    f"resolving infused token {balance.symbol}: {exc}", code=exc.code, data=exc.data
+                ) from exc
+            assets.append(InfusedAsset(token_id=_parse_carbon_id(token.carbon_id, balance.symbol)))
+        owned = _read_all_pages(
+            lambda cursor: self.get_account_owned_tokens(
+                address,
+                "",
+                0,
+                page_size=100,
+                cursor=cursor,
+                check_address_reserved_byte=False,
+                address_type=ADDRESS_TYPE_CARBON,
+            )
+        )
+        for token in owned:
+            try:
+                balance = self.get_token_balance(
+                    address, token.symbol, "main", check_address_reserved_byte=False, address_type=ADDRESS_TYPE_CARBON
+                )
+            except RPCError as exc:
+                raise RPCError(
+                    f"reading infused {token.symbol} instances: {exc}", code=exc.code, data=exc.data
+                ) from exc
+            if not balance.amount.isdigit():
+                raise RPCError(f"infused {token.symbol} instance count {balance.amount!r} is not a decimal integer")
+            assets.append(
+                InfusedAsset(
+                    token_id=_parse_carbon_id(token.carbon_id, token.symbol),
+                    non_fungible=True,
+                    instance_count=int(balance.amount),
+                )
+            )
+        return assets
+
+    def preflight_transaction(self, msg: TxMsg) -> PreflightResult:
+        """Asks the chain whether the symbol a CreateToken claims is already in use.
+
+        The call consumes its policy fee - the largest single price in the protocol, set by
+        governance and readable from getGasConfig - before the contract looks at the symbol, so
+        sending one that is taken pays that fee for nothing. One lookup answers it.
+
+        A symbol that resolves to a token is TAKEN. A symbol that does not is reported by the node
+        as an ordinary RPC error, the same way it reports a missing method or a failed backend, and
+        nothing in the answer separates those: every one of them arrives as the same internal error
+        code with prose for a message. So an error alone is never read as absence. Instead the
+        check asks a second question it already knows the answer to - fetch the CONTROL token by
+        its id, which the node resolves without touching the symbol at all. A node that answers
+        that is a node that is answering, so its refusal about the caller's symbol is a real
+        absence and the verdict is FREE; a node that does not answer it has established nothing
+        and the verdict is UNKNOWN. Without a control every absent symbol is unknown.
+
+        The control proves the node is serving token lookups. It does not exercise symbol
+        resolution itself, so a node whose token rows read while its symbol index does not would
+        still be believed. That is the residual, and it is a far narrower one than trusting an
+        error message.
+
+        The verdict is reported rather than acted on; send_transaction refuses on taken and on
+        unknown. The message's own validity - flags, metadata, schemas - is enforced by the
+        builders; this is the part only the chain can answer.
+        """
+        not_applicable = PreflightResult(PreflightVerdict.NOT_APPLICABLE)
+        call = msg.msg
+        if (
+            not isinstance(call, TxMsgCall)
+            or msg.type != TxType.CALL
+            or call.module_id != ModuleID.TOKEN
+            or call.method_id != TokenContractMethod.CREATE_TOKEN
+        ):
+            return not_applicable
+        try:
+            info = deserialize(call.args, TokenInfo)
+        except Exception as exc:
+            raise RPCError(f"preflight: CreateToken arguments: {exc}") from exc
+        assert isinstance(info, TokenInfo)
+        symbol = info.symbol.value
+        if not symbol:
+            return not_applicable
+        subject = f"token symbol {symbol}"
+
+        # A token came back, so the symbol resolves to one. Nothing else is read from it: the
+        # question was only whether it exists.
+        try:
+            self.get_token(symbol, extended=False)
+        except RPCError as lookup_error:
+            try:
+                control = self.control_token_id()
+            except RPCError:
+                control = 0
+            if control == 0:
+                return PreflightResult(PreflightVerdict.UNKNOWN, subject, _lookup_reason(lookup_error))
+            try:
+                self.get_token("", extended=False, carbon_token_id=control)
+            except RPCError as probe_error:
+                return PreflightResult(PreflightVerdict.UNKNOWN, subject, _lookup_reason(probe_error))
+            return PreflightResult(PreflightVerdict.FREE, subject)
+        return PreflightResult(PreflightVerdict.TAKEN, subject)
+
+    def send_transaction(
+        self, msg: TxMsg, signers: Sequence[TxSigner], options: SendTransactionOptions | None = None
+    ) -> str:
+        """Sends a message in one step: pre-flight, fee plan, signatures, broadcast.
+
+        A message whose max_gas is still zero is planned against this chain's prices (fees); one
+        the caller already planned is sent as it is. Every witness signs through its TxSigner -
+        keys, hardware, or a remote service. Returns the transaction hash.
+
+        The pre-flight refuses a token creation whose symbol the chain says is taken, and one it
+        could not establish anything about; see SendTransactionOptions.skip_preflight.
+        """
+        options = options or SendTransactionOptions()
+        if not options.skip_preflight:
+            check = self.preflight_transaction(msg)
+            if check.verdict is PreflightVerdict.TAKEN:
+                raise PreflightError(f"{check.subject} is already taken")
+            if check.verdict is PreflightVerdict.UNKNOWN:
+                raise PreflightError(f"could not establish whether {check.subject} is taken: {check.reason}")
+        if msg.max_gas == 0:
+            # Only the witness-array types take their witness count from the caller; for every
+            # other type the message itself fixes the slots, and one signer may legitimately fill
+            # two of them.
+            plan_options = options.plan
+            if required_witnesses(msg) is None and plan_options.facts.witness_count is None:
+                plan_options = replace(plan_options, facts=replace(plan_options.facts, witness_count=len(signers)))
+            msg = self.fees.plan(msg, plan_options).apply(msg)
+        return self.send_carbon_transaction(sign_and_serialize_tx_msg_with(msg, *signers))
+
     def get_version(self) -> BuildInfoResult:
         return _decode_dataclass(BuildInfoResult, self.call("getVersion"))
 
@@ -1533,6 +1884,39 @@ def convert_decimals(raw: str | int, decimals: int, separator: str = ".") -> str
     fraction = fraction.rstrip("0")
     out = integer if not fraction else integer + separator + fraction
     return "-" + out if negative else out
+
+
+def _lookup_reason(error: RPCError) -> str:
+    # The node's own words when it answered with a JSON-RPC error, or the transport failure
+    # otherwise. Neither is inspected further: nothing in either distinguishes "there is no such
+    # symbol" from "this node could not tell you".
+    return str(error) or "the lookup failed"
+
+
+def _parse_carbon_id(value: str, symbol: str) -> int:
+    if not value.isdigit():
+        raise RPCError(f"token {symbol} has no Carbon id: {value!r}")
+    return int(value)
+
+
+def _read_all_pages(page: Callable[[str], CursorPaginatedResult[list[T]]]) -> list[T]:
+    # Walks a cursor-paginated query to the end. The loop is driven by the cursor the node returns,
+    # never by an item count, and stops on a cursor it has already seen or past a page cap so a
+    # misbehaving node cannot keep it going forever.
+    max_pages = 1000
+    items: list[T] = []
+    seen: set[str] = set()
+    cursor = ""
+    for _ in range(max_pages):
+        result = page(cursor)
+        items.extend(result.result or [])
+        if not result.cursor:
+            return items
+        if result.cursor in seen:
+            return items
+        seen.add(result.cursor)
+        cursor = result.cursor
+    raise RPCError(f"the node kept returning pages past {max_pages}")
 
 
 def _extract_hash_result(result: Any) -> str:
