@@ -156,14 +156,99 @@ Carbon token and NFT helpers validate required metadata, token symbol casing,
 standard schema fields, Carbon NFT address packing, and result parsing. Token
 symbols follow the Carbon token-module rule of uppercase ASCII letters `A-Z`.
 
-Carbon transaction signing is available without going through RPC:
+## Fee planning: build, plan, sign, send
+
+Under gas model v2 every byte a transaction puts in the block is billed and every
+new storage row is escrowed, so the fee of a native operation is a function of
+the message and the chain's prices - and the SDK computes it from the message.
+Builders carry no prices: a message built without a `max_gas` has a zero offer,
+which marks it as unplanned and refuses to sign. The steps are:
+
+1. **Build** the message with a builder (`build_transfer_fungible_tx`,
+   `build_create_token_tx`, `build_mint_phantasma_non_fungible_tx`, ...). The
+   builders write only the limits you pass (`TxLimits`).
+2. **Plan** it against the chain: `rpc.fees.plan(msg)` reads the chain's gas
+   config through the client (cached for a minute), recognises the operation and
+   prices it. For every operation the SDK models the bill is exact for the facts
+   it was given; a chain-state fact the message does not carry - whether the
+   recipient already holds the token, whether the series is duplicated - defaults
+   to the reading that costs more, so an unstated plan is an upper bound the
+   settlement can only undercut, and the unused part of the offer is refunded.
+   State what you know in `PlanRequestOptions` to get the exact quote. A burn of
+   an NFT is planned for what the NFT holds: the client reads the NFT's address
+   for you; the pure `plan_fees` demands the list instead.
+3. **Sign** with every witness the message needs: `sign_tx_msg(planned, *keys)`
+   for in-memory keys, `sign_tx_msg_with(planned, *signers)` for a `TxSigner`
+   such as a hardware wallet. A gas-payer transfer takes the payer's and the
+   owner's keys; the SDK puts them in the order the chain reads.
+4. **Send** the envelope with `rpc.send_carbon_transaction(raw)`.
+
+`rpc.send_transaction(msg, signers)` does all four in one step, plus a
+pre-flight: a token creation pays its policy fee before the chain looks at the
+symbol, so the client asks whether the symbol is taken and refuses to send
+unless the chain answered that it is free. `rpc.preflight_transaction(msg)`
+reports that verdict to callers who want to decide for themselves.
 
 ```python
-from phantasma_py.carbon import sign_and_serialize_tx_msg_hex
+from phantasma_py import PhantasmaRPC, build_transfer_fungible_tx, summarize_fee_plan
+from phantasma_py.carbon import bytes32_from_public_key
+from phantasma_py.crypto import PhantasmaKeys
+
+rpc = PhantasmaRPC("http://localhost:5172/rpc")
+keys = PhantasmaKeys.from_wif("...")
+msg = build_transfer_fungible_tx(
+    from_address=bytes32_from_public_key(keys.public_key),
+    to=receiver,
+    token_id=1,  # KCAL
+    amount=100_000_000,
+)
+
+plan = rpc.fees.plan(msg)
+summary = summarize_fee_plan(plan)
+print(f"gas {summary.gas_bill} KCAL, storage deposit up to {summary.storage_ceiling} SOUL")
+
+# The wallet shows the summary and asks; then:
+tx_hash = rpc.send_transaction(msg, [keys])
+```
+
+Notes:
+
+- `summarize_fee_plan` renders a plan in KCAL and SOUL; `plan.apply(msg)` returns
+  the message with the plan written in when you sign yourself.
+- A message keeps a default lifetime of 45 seconds. When a person sits between
+  building and signing, set `TxLimits.expiry` from the chain's own window:
+  `expiry_within(rpc.fees.chain_params().expiry_window_ms)`.
+- Calls whose witness set the caller chooses (token creation, series creation,
+  Phantasma mints, name registration) need `witness_count` in the plan options;
+  `send_transaction` and the `build_*_tx_and_sign` helpers fill it in from the
+  signers they are given.
+- Scripts and calls the SDK does not model are planned as a budget
+  (`NativeFeeKind.SCRIPT`), not a formula; the node's `estimate_transaction`
+  gives their exact bill.
+- A node that refuses a request with an HTTP error and a JSON-RPC body surfaces
+  the body as an `RPCError` with the node's code and message, so the node's
+  refusal is told from a transport failure.
+
+`examples/plan_carbon_transfer_fee.py` plans a one-atom KCAL transfer against a
+node and prints the summary without signing or sending anything.
+
+Carbon transaction signing is available without going through RPC. Without a
+chain to plan against, state the offer yourself; a 170-byte KCAL transfer bills
+0.00426 KCAL on mainnet, and the unused part of the offer is refunded:
+
+```python
+from phantasma_py.carbon import TxLimits, build_transfer_fungible_tx, sign_and_serialize_tx_msg_hex
 from phantasma_py.crypto import PhantasmaKeys
 
 keys = PhantasmaKeys.from_wif("...")
-raw_hex = sign_and_serialize_tx_msg_hex(tx_msg, keys)
+msg = build_transfer_fungible_tx(
+    from_address=sender,
+    to=receiver,
+    token_id=1,
+    amount=1_000_000,
+    limits=TxLimits(max_gas=50_000_000),  # 0.005 KCAL
+)
+raw_hex = sign_and_serialize_tx_msg_hex(msg, keys)
 ```
 
 ## Development

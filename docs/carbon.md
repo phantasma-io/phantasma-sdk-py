@@ -102,9 +102,14 @@ assert serialize(decoded) == raw_bytes
 ```
 
 Use `sign_tx_msg()`, `sign_and_serialize_tx_msg()`, or
-`sign_and_serialize_tx_msg_hex()` for Carbon transaction signing. These helpers
-sign the serialized `TxMsg` and create the same witness shape as the Go, C#,
-and TypeScript SDKs.
+`sign_and_serialize_tx_msg_hex()` for Carbon transaction signing with in-memory
+keys - one key per witness the message needs, in any order - and
+`sign_tx_msg_with()` for any `TxSigner` (a hardware wallet, a signing service).
+These helpers sign the serialized `TxMsg` and create the same witness shape as
+the Go, C#, Rust and TypeScript SDKs; a message whose `max_gas` is zero is
+refused as unplanned. `required_witnesses()` names the witnesses a message's
+type fixes and `envelope_bytes()` the size the signed message will have, which
+gas model v2 bills.
 
 ```python
 from phantasma_py.carbon import sign_and_serialize_tx_msg_hex

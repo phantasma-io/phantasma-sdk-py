@@ -998,3 +998,40 @@ def plan_and_sign_with_keys(
         facts.witness_count = len(keys)
     plan = plan_fees(msg, config, facts)
     return sign_and_serialize_tx_msg(plan.apply(msg), *keys)
+
+
+#: Decimals of the gas token: 1 KCAL = 1e10 kcal-base.
+KCAL_DECIMALS = 10
+#: Decimals of the data token: 1 SOUL = 1e8 atoms.
+SOUL_DECIMALS = 8
+
+
+@dataclass(slots=True, frozen=True)
+class FeePlanSummary:
+    """A fee plan in the units a person reads: KCAL for gas, SOUL for the storage deposit."""
+
+    #: What the transaction will cost in gas, as a decimal amount.
+    gas_bill: str
+    #: The gas offer written into the transaction; the difference to gas_bill is refunded.
+    gas_offer: str
+    #: The storage deposit the transaction may take, as a decimal amount. It is escrowed while the
+    #: transaction settles and refunded when the rows it paid for are deleted; a wallet shows it
+    #: separately from the fee, as a refundable deposit.
+    storage_ceiling: str
+
+
+def summarize_fee_plan(plan: FeePlan) -> FeePlanSummary:
+    """Renders a plan for display in KCAL and SOUL."""
+    return summarize_fee_plan_with_decimals(plan, KCAL_DECIMALS, SOUL_DECIMALS)
+
+
+def summarize_fee_plan_with_decimals(plan: FeePlan, gas_decimals: int, data_decimals: int) -> FeePlanSummary:
+    """Renders a plan for display on a chain whose gas or data token has other decimals."""
+    # The client module imports this one, so the decimal renderer is fetched on use.
+    from .rpc import convert_decimals
+
+    return FeePlanSummary(
+        gas_bill=convert_decimals(plan.expected_gas_bill, gas_decimals),
+        gas_offer=convert_decimals(plan.max_gas, gas_decimals),
+        storage_ceiling=convert_decimals(plan.max_data, data_decimals),
+    )

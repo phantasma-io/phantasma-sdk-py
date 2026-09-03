@@ -17,9 +17,31 @@ Some endpoints echo ids as JSON strings even when the caller uses a numeric id;
 the Python client compares ids by string value to stay compatible while still
 rejecting mismatches.
 
+## Fee Planning And Sending
+
+Every client owns a fee planner, `rpc.fees`, which reads the chain's gas config
+through the client (cached for a minute; `rpc.fees.invalidate()` forgets it) and
+prices a Carbon message from the message itself:
+
+```python
+plan = rpc.fees.plan(msg)                  # FeePlan: max_gas, max_data, expected_gas_bill, rows
+params = rpc.fees.chain_params()           # expiry window, block rate, gas model version
+config = rpc.fees.config()                 # the GasConfig, for the pure plan_fees / estimate_native_fee
+```
+
+`rpc.send_transaction(msg, signers, options=None)` plans an unplanned message,
+pre-flights a token creation, collects every witness through its `TxSigner`
+and broadcasts the envelope in one step; `rpc.preflight_transaction(msg)`
+reports the pre-flight verdict alone, and `rpc.infused_assets(token_id,
+instance_id)` reads what an NFT holds at its own address, which a burn returns
+and pays for. A pre-flight refusal raises `PreflightError` before anything is
+signed. See the README for the whole build, plan, sign, send flow.
+
 ## Errors
 
-Transport and RPC failures raise `RPCError`.
+Transport and RPC failures raise `RPCError`; a JSON-RPC error body reaches the
+caller as an `RPCError` with the node's code and message whatever the HTTP
+status carried it.
 
 ```python
 from phantasma_py.errors import RPCError
