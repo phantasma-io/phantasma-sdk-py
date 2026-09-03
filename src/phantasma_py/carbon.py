@@ -2189,9 +2189,9 @@ def required_witnesses(msg: TxMsg) -> list[Bytes32] | None:
 
 
 def envelope_bytes(msg: TxMsg, witness_count: int | None = None) -> int:
-    """The size in bytes of a message once signed - the envelope the block carries and gas model v2
-    bills - computed without a key: signatures are fixed-width, so zero-filled placeholder witnesses
-    serialize to exactly the signed length.
+    """The size in bytes of a message once signed. That is the envelope the block carries and gas
+    model v2 bills. No key is needed: signatures are fixed-width, so zero-filled placeholder
+    witnesses serialize to exactly the signed length.
 
     The witness set is the one the message requires; for the witness-array types pass how many
     witnesses will sign (None sizes one). Every other type fixes its own count, and a stated count
@@ -2252,9 +2252,11 @@ def sign_and_serialize_tx_msg_hex(msg: TxMsg, *keys: PhantasmaKeys) -> str:
 
 
 def sign_tx_msg_with(msg: TxMsg, *signers: TxSigner) -> SignedTxMsg:
-    """Signs a message with any TxSigners - keys, hardware wallets, remote services - one per
-    witness. Every signer signs the same serialized message; a signer that must witness twice (the
-    same account paying the gas and owning the tokens) is asked once and its signature reused."""
+    """Signs a message with any TxSigners, one per witness. A signer can hold keys, drive a hardware
+    wallet or call a remote service. Every signer signs the same serialized message.
+
+    One account can fill two witness slots, when it pays the gas and owns the tokens. Such a signer
+    is asked once and its signature is reused."""
     _assert_planned(msg)
     addresses = [bytes32_from_public_key(signer.public_key) for signer in signers]
     slots = _witness_slots(msg, addresses)
@@ -2284,8 +2286,8 @@ def _witness_slots(msg: TxMsg, addresses: list[Bytes32]) -> list[tuple[Bytes32, 
     # Pairs every witness slot of the envelope with the signer (by index) that owns its address. For
     # the types whose witness set the node fixes (native transfers, mints, burns and their gas-payer
     # variants) the slots come in envelope order regardless of how the signers were passed, and the
-    # signer set must match the required addresses exactly - a missing owner key or a stray extra
-    # key is a caller mistake the node would reject later at a cost. For the witness-array types the
+    # signer set must match the required addresses exactly. A missing owner key or a stray extra key
+    # is a caller mistake, and the node would reject it later at a cost. For the witness-array types the
     # caller's order is the envelope order, and the gas payer must be among them.
     required = required_witnesses(msg)
     if required is None:
@@ -2323,8 +2325,8 @@ class TxLimits:
     #: The storage-escrow ceiling in data-token atoms (TxMsg.max_data).
     max_data: int = 0
     #: The expiry as a millisecond timestamp (TxMsg.expiry). 0 = DEFAULT_TX_EXPIRY_MS from now. A
-    #: flow with a person in it - a hardware wallet confirming, a wallet-link round trip - should
-    #: set this from the chain's own window instead; see expiry_within.
+    #: flow with a person in it should set this from the chain's own window instead. Examples are a
+    #: hardware wallet confirming and a wallet-link round trip. See expiry_within.
     expiry: int = 0
 
 
@@ -2333,7 +2335,7 @@ class TxLimits:
 #: The chain reads the expiry in milliseconds and refuses anything at or beyond now + expiryWindow,
 #: where expiryWindow is a chain setting whose node default is 60,000 ms. A default has to hold on
 #: the shortest window a chain may run, and it is compared against the NODE's clock, so it also has
-#: to survive the two clocks disagreeing - hence a quarter of a minute of headroom rather than the
+#: to survive the two clocks disagreeing, so it keeps a quarter of a minute of headroom and not the
 #: whole minute. Chains that allow longer report it as expiryWindow in getGasConfig, reachable as
 #: PhantasmaRPC.fees.chain_params().
 DEFAULT_TX_EXPIRY_MS = 45_000
@@ -2612,7 +2614,9 @@ def build_token_info(
         if not token_schemas:
             raise BuilderError("token schemas are required for NFTs")
         flags = TokenFlags.NON_FUNGIBLE
-    elif not max_supply.is_8_byte_safe:
+    elif max_supply.value == 0 or not max_supply.is_8_byte_safe:
+        # An unlimited supply (zero) has no int64 bound, so the chain requires the big-fungible flag
+        # for it and refuses the creation otherwise. That is the same rule as a supply past int64.
         flags = TokenFlags.BIG_FUNGIBLE
     return TokenInfo(max_supply, flags, decimals, owner, SmallString(symbol), bytes(metadata), bytes(token_schemas))
 
@@ -2683,8 +2687,8 @@ def build_create_token_tx_and_sign(
     config: GasConfig | None = None,
     options: PlanAndSignOptions | None = None,
 ) -> bytes:
-    """Builds a CreateToken call, plans it against config - unless options.limits fixes the offer -
-    and signs it with the creator's keys. See plan_and_sign_with_keys."""
+    """Builds a CreateToken call, plans it against config and signs it with the creator's keys. A
+    call whose offer options.limits already fixes is signed as it is. See plan_and_sign_with_keys."""
     from .fees import PlanAndSignOptions, plan_and_sign_with_keys
 
     options = options or PlanAndSignOptions()
@@ -2859,10 +2863,11 @@ def unpack_nft_address(address: Bytes32) -> tuple[int, int]:
 
 
 def is_nft_address(address: Bytes32) -> bool:
-    """Whether a 32-byte address is an NFT-derived address - the address every minted instance owns,
-    which assets are sent to when they are infused into that NFT. The form is syntactic, the same
-    test the chain applies: fifteen zero bytes, a 0x01 marker, then a nonzero token id and a nonzero
-    instance id. plan_fees uses it to price the recipient's owner lookup."""
+    """Whether a 32-byte address is an NFT-derived address. Every minted instance owns such an
+    address, and assets infused into that NFT are sent to it.
+
+    The test is syntactic and is the one the chain applies: fifteen zero bytes, a 0x01 marker, then a
+    nonzero token id and a nonzero instance id. plan_fees uses it to price the recipient's owner lookup."""
     if address[15] != 1 or any(address[:15]):
         return False
     token_id, instance_id = unpack_nft_address(address)

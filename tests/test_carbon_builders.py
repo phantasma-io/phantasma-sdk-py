@@ -233,9 +233,19 @@ def test_token_builder_validation_matches_reference_sdks() -> None:
 
     with pytest.raises(BuilderError):
         build_token_info("TEST", IntX(0), is_nft=False, decimals=0, owner=Bytes32(), metadata=None)  # type: ignore[arg-type]
+    # An unlimited supply (zero) has no int64 bound, so the chain requires the big-fungible flag and
+    # refuses an "unlimited small fungible"; a bounded supply that fits int64 is small.
     assert (
         build_token_info("FUNGIBLE", IntX(0), is_nft=False, decimals=8, owner=Bytes32(), metadata=metadata).flags
+        == TokenFlags.BIG_FUNGIBLE
+    )
+    assert (
+        build_token_info("FUNGIBLE", IntX(100_000), is_nft=False, decimals=8, owner=Bytes32(), metadata=metadata).flags
         == TokenFlags.NONE
+    )
+    assert (
+        build_token_info("FUNGIBLE", IntX(1 << 70), is_nft=False, decimals=8, owner=Bytes32(), metadata=metadata).flags
+        == TokenFlags.BIG_FUNGIBLE
     )
     with pytest.raises(BuilderError):
         build_token_info(
