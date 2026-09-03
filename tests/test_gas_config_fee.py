@@ -1,9 +1,8 @@
-"""Gas-model-v2 GasConfig wire format + Tier-1 fee estimator tests.
+"""Gas-model-v2 GasConfig wire format and getGasConfig conversion tests.
 
 The chain serializes the 10 v2 config fields only for version >= 1; the version-0 image is
-frozen forever (historical replay). Expected fee numbers are hand-derived from the chain
-billing formula and pinned as constants so any formula regression fails loudly. The same
-fixtures and expectations exist in every SDK (parity suite).
+frozen forever (historical replay). The calculator itself is tested in
+tests/test_native_fee_estimator.py.
 """
 
 from __future__ import annotations
@@ -18,11 +17,8 @@ from phantasma_py import (
     GasConfig,
     GasConfigDataResult,
     GasConfigResult,
-    NativeFeeKind,
     RPCError,
     SerializationError,
-    envelope_bytes_for,
-    estimate_native_fee,
 )
 
 
@@ -110,112 +106,6 @@ class TestGasConfigWireFormat:
         truncated = serialize(v2_config())[:113]
         with pytest.raises(SerializationError):
             GasConfig.read_carbon(CarbonReader(truncated))
-
-
-class TestEstimateNativeFee:
-    def test_v1_transfer_existing_recipient_bills_work_only(self) -> None:
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, live_v1_config(), fresh_rows=0)
-
-        assert estimate.expected_gas_bill == 100_000
-        # stdFee shape: 2x min offer + work + flat 1 KiB byte allowance.
-        assert estimate.max_gas == 10 * 2 + 100_000 + 1024 * 250_000
-        assert estimate.max_data == 0
-
-    def test_v1_transfer_defaults_include_one_fresh_row(self) -> None:
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, live_v1_config())
-
-        assert estimate.expected_gas_bill == 100_000 + 250_000
-        assert estimate.max_data == 2
-
-    def test_v2_transfer_default_envelope_bill(self) -> None:
-        # Default envelope 512 + 1 fresh row: blockData 513 -> 12825 byte units + 10 work
-        # units = 12835 units * 10000 = 128_350_000 kcal-base (above the 1e7 floor).
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, v2_config())
-
-        assert estimate.expected_gas_bill == 128_350_000
-        assert estimate.max_gas == 128_350_000 + 128_350_000 // 4
-        assert estimate.max_data == 200_000
-
-    def test_v2_transfer_exact_envelope_bill(self) -> None:
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, v2_config(), envelope_bytes=250, fresh_rows=0)
-
-        assert estimate.expected_gas_bill == (10 + 250 * 25) * 10_000
-
-    def test_v2_floor_applies_to_small_bills(self) -> None:
-        config = v2_config()
-        config.minimum_gas_bill = 10_000_000_000  # exaggerated floor above the computed bill
-
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, config, envelope_bytes=250, fresh_rows=0)
-
-        assert estimate.expected_gas_bill == 10_000_000_000
-        assert estimate.max_gas >= 10_000_000_000
-
-    def test_v2_nft_multi_transfer_scales_units_and_rows(self) -> None:
-        # Under v2 each instance recreates its lookup row -> escrow allowance (count + 1) rows.
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_NON_FUNGIBLE, v2_config(), count=5, envelope_bytes=300)
-
-        # work 5*10 units + bytes (300 envelope + 6 rows) * 25 units, all * 10000.
-        assert estimate.expected_gas_bill == (50 + 306 * 25) * 10_000
-        assert estimate.max_data == 6 * 200_000
-
-    def test_create_token_both_models(self) -> None:
-        # v1 charges unit-priced product fees through the multiplier; v2 pays the direct
-        # kcal-base policy fee (no multiplier) plus the byte fee for its envelope.
-        v1 = estimate_native_fee(
-            NativeFeeKind.CREATE_TOKEN, live_v1_config(), symbol_length=4, fresh_rows=0, envelope_bytes=1000
-        )
-        assert v1.expected_gas_bill == (10_000_000_000 + 1_250_000_000) * 10_000
-
-        v2 = estimate_native_fee(
-            NativeFeeKind.CREATE_TOKEN, v2_config(), symbol_length=4, fresh_rows=0, envelope_bytes=1000
-        )
-        policy = 100_000_000_000_000 + (100_000_000_000_000 >> 3)
-        assert v2.expected_gas_bill == policy + 1000 * 25 * 10_000
-
-    def test_register_name_length_discount(self) -> None:
-        v1 = estimate_native_fee(
-            NativeFeeKind.REGISTER_NAME, live_v1_config(), name_length=8, fresh_rows=0, envelope_bytes=300
-        )
-        v2 = estimate_native_fee(
-            NativeFeeKind.REGISTER_NAME, v2_config(), name_length=8, fresh_rows=0, envelope_bytes=300
-        )
-
-        assert v1.expected_gas_bill == (10_000_000_000_000 >> 7) * 10_000
-        assert v2.expected_gas_bill == (100_000_000_000_000_000 >> 7) + 300 * 25 * 10_000
-
-    def test_script_kind_budgets_vm_allowance(self) -> None:
-        # Default 5000 VM units exceeds every script in mainnet history (max 3392).
-        estimate = estimate_native_fee(NativeFeeKind.SCRIPT, v2_config(), envelope_bytes=568, fresh_rows=0)
-
-        # (5000 vm units + (568 + 512 events) * 25) * 10000
-        assert estimate.expected_gas_bill == (5000 + 1080 * 25) * 10_000
-
-    def test_envelope_bytes_follow_witness_layout(self) -> None:
-        # Native kinds append bare 64-byte signatures; call/script kinds append a
-        # length-prefixed 96-byte witness array (mirrors SignedTxMsg).
-        assert envelope_bytes_for(NativeFeeKind.TRANSFER_FUNGIBLE, 150) == 150 + 64
-        assert envelope_bytes_for(NativeFeeKind.TRANSFER_FUNGIBLE, 150, 2) == 150 + 128
-        assert envelope_bytes_for(NativeFeeKind.CREATE_TOKEN, 900) == 900 + 4 + 96
-        assert envelope_bytes_for(NativeFeeKind.SCRIPT, 500, 2) == 500 + 4 + 192
-
-    def test_invalid_inputs_raise(self) -> None:
-        # Impossible inputs are rejected instead of quoting fees the chain would never admit.
-        with pytest.raises(ValueError):
-            estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, live_v1_config(), count=0)
-        with pytest.raises(ValueError):
-            estimate_native_fee(NativeFeeKind.REGISTER_NAME, live_v1_config())
-        with pytest.raises(ValueError):
-            # max_token_symbol_length is 10
-            estimate_native_fee(NativeFeeKind.CREATE_TOKEN, live_v1_config(), symbol_length=11)
-
-    def test_oversized_fee_shift_zeroes_scaled_terms(self) -> None:
-        # The chain clamps shifts >= 64 to a zero work delta; the estimator must match.
-        config = live_v1_config()
-        config.fee_shift = 64
-
-        estimate = estimate_native_fee(NativeFeeKind.TRANSFER_FUNGIBLE, config, fresh_rows=0)
-
-        assert estimate.expected_gas_bill == 0
 
 
 class TestGasConfigResultDecoding:

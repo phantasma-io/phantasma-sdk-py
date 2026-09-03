@@ -1,8 +1,8 @@
-"""estimateTransaction response decoding + Tier-2 fee-estimate conversion.
+"""estimateTransaction response decoding + fee-quote conversion.
 
 The node serializes 64-bit amounts as decimal strings (JSON-number precision). A completed
-estimate must convert into the same NativeFeeEstimate the Tier-1 estimator produces, so wallet
-code consumes both tiers identically. The same fixtures exist in every SDK (parity suite).
+estimate must convert into the same FeeQuote the offline calculator produces, so wallet code
+consumes both sources identically. The same fixtures exist in every SDK (parity suite).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ _ABORTED = {
 def test_completed_estimate_converts() -> None:
     result = _decode_dataclass(EstimateTransactionResult, _COMPLETED)
     assert result.would_abort is False
-    estimate = result.to_fee_estimate()
+    estimate = result.to_fee_quote()
     # Above-2^53 value survives exactly because it rides a string.
     assert estimate.max_gas == 100_000_000_000_000_000
     assert estimate.max_data == 400_000
@@ -54,11 +54,11 @@ def test_aborted_estimate_refuses_conversion() -> None:
     result = _decode_dataclass(EstimateTransactionResult, _ABORTED)
     assert result.would_abort is True
     with pytest.raises(RPCError, match="gas fees"):
-        result.to_fee_estimate()
+        result.to_fee_quote()
 
 
 def test_missing_field_fails() -> None:
     # A malformed server response (lost field) must not silently become a zero ceiling.
     result = _decode_dataclass(EstimateTransactionResult, {"wouldAbort": False})
     with pytest.raises(RPCError, match="recommendedMaxGas"):
-        result.to_fee_estimate()
+        result.to_fee_quote()

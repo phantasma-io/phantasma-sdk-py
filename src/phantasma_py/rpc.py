@@ -16,7 +16,6 @@ from ._wire_shapes import snake_to_camel
 from .carbon import (
     Bytes32,
     GasConfig,
-    NativeFeeEstimate,
     SignedTxMsg,
     TxMsg,
     parse_create_token_result,
@@ -27,6 +26,7 @@ from .carbon import (
 from .crypto import PhantasmaKeys
 from .errors import RPCError
 from .extended_events import EventExResult
+from .fees import FeeQuote
 from .transaction import Transaction, tx_state_is_fault, tx_state_is_success
 from .vm import VMObject
 from .vm_value import VmValue
@@ -342,17 +342,17 @@ class EstimateTransactionResult:
     recommended_max_gas: str | None = None
     recommended_max_data: str | None = None
 
-    def to_fee_estimate(self) -> NativeFeeEstimate:
-        """Convert a completed estimate into the Tier-1 NativeFeeEstimate.
+    def to_fee_quote(self) -> FeeQuote:
+        """Convert a completed estimate into the FeeQuote the offline calculator also produces.
 
         max_gas/max_data are the recommended ceilings and expected_gas_bill is the exact settled
-        bill, so wallet code consumes both tiers identically. Raises RPCError when would_abort is
+        bill, so wallet code consumes both sources identically. Raises RPCError when would_abort is
         set - an aborted simulation has no recommendations (retry with a higher offer or fall back
-        to the Tier-1 estimator) - and on malformed numeric strings.
+        to the offline calculator) - and on malformed numeric strings.
         """
         if self.would_abort:
             raise RPCError(f"estimateTransaction reported the transaction would abort: {self.abort_reason}")
-        return NativeFeeEstimate(
+        return FeeQuote(
             max_gas=_parse_estimate_u64(self.recommended_max_gas, "recommendedMaxGas"),
             max_data=_parse_estimate_u64(self.recommended_max_data, "recommendedMaxData"),
             expected_gas_bill=_parse_estimate_u64(self.gas_bill_kcal_base, "gasBillKcalBase"),
