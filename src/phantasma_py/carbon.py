@@ -73,6 +73,29 @@ SYSTEM_ADDRESS_NULL = Bytes32()
 SYSTEM_ADDRESS_GAS_POOL = Bytes32(bytes(31) + b"\x01")
 SYSTEM_ADDRESS_DATA_POOL = Bytes32(bytes(31) + b"\x02")
 STANDARD_META_ID = "_i"
+
+# Standard metadata keys the chain recognises in token, series and chain metadata. The fee planner
+# reads the token keys that change a creation's bill (_brn, _ip, _soi, _srt) out of the CreateToken
+# call; the builders write _i into series metadata and NFT ROMs.
+STANDARD_META_CHAIN_ADDRESS = "_a"
+STANDARD_META_CHAIN_NAME = "_n"
+STANDARD_META_CHAIN_NEXUS = "_x"
+STANDARD_META_CHAIN_TOKENOMICS = "_t"
+STANDARD_META_TOKEN_STAKING_ORG_ID = "_soi"
+STANDARD_META_TOKEN_STAKING_ORG_THRESHOLD = "_sot"
+STANDARD_META_TOKEN_STAKING_REWARD_TOKEN = "_srt"
+STANDARD_META_TOKEN_STAKING_REWARD_PERIOD = "_srp"
+STANDARD_META_TOKEN_STAKING_REWARD_MUL = "_srm"
+STANDARD_META_TOKEN_STAKING_REWARD_DIV = "_srd"
+STANDARD_META_TOKEN_STAKING_LOCK = "_sl"
+STANDARD_META_TOKEN_STAKING_BOOSTER_TOKEN = "_sbt"
+STANDARD_META_TOKEN_STAKING_BOOSTER_MUL = "_sbm"
+STANDARD_META_TOKEN_STAKING_BOOSTER_DIV = "_sbd"
+STANDARD_META_TOKEN_STAKING_BOOSTER_LIMIT = "_sbl"
+STANDARD_META_TOKEN_PHANTASMA_SCRIPT = "_phs"
+STANDARD_META_TOKEN_PHANTASMA_ABI = "_phb"
+STANDARD_META_TOKEN_PRE_BURN = "_brn"
+STANDARD_META_TOKEN_INFLATION_PERIOD = "_ip"
 _MISSING = object()
 
 
@@ -417,6 +440,15 @@ class TokenContractMethod(IntEnum):
     SET_TOKENS_CONFIG = 25
     UPDATE_SERIES_METADATA = 26
     MINT_PHANTASMA_NON_FUNGIBLE = 27
+
+
+class GovernanceContractMethod(IntEnum):
+    """Governance module method ids the SDK recognises."""
+
+    #: Registers a name for an address.
+    REGISTER_NAME = 1
+    #: Replaces the chain's gas configuration.
+    SET_GAS_CONFIG = 3
 
 
 class TokenFlags(IntFlag):
@@ -1332,6 +1364,23 @@ class UpdateSeriesMetadataArgs:
     @classmethod
     def read_carbon(cls, reader: CarbonReader) -> UpdateSeriesMetadataArgs:
         return cls(reader.read8u(), reader.read4u(), reader.read_byte_array())
+
+
+@dataclass(slots=True)
+class RegisterNameArgs:
+    """Governance-module arguments for registering a name: the address the name is registered for,
+    then the name."""
+
+    address: Bytes32 = EMPTY_BYTES32
+    name: SmallString = field(default_factory=SmallString)
+
+    def write_carbon(self, writer: CarbonWriter) -> None:
+        writer.write32(self.address)
+        self.name.write_carbon(writer)
+
+    @classmethod
+    def read_carbon(cls, reader: CarbonReader) -> RegisterNameArgs:
+        return cls(reader.read32(), SmallString.read_carbon(reader))
 
 
 @dataclass(slots=True)
@@ -2746,6 +2795,23 @@ def get_nft_address(carbon_token_id: int, instance_id: int) -> Bytes32:
     address[16:24] = carbon_token_id.to_bytes(8, "little")
     address[24:32] = instance_id.to_bytes(8, "little")
     return Bytes32(address)
+
+
+def unpack_nft_address(address: Bytes32) -> tuple[int, int]:
+    """Splits a Carbon NFT address into the token id and instance id it was derived from. It does
+    not check the address form; see is_nft_address."""
+    return int.from_bytes(address[16:24], "little"), int.from_bytes(address[24:32], "little")
+
+
+def is_nft_address(address: Bytes32) -> bool:
+    """Whether a 32-byte address is an NFT-derived address - the address every minted instance owns,
+    which assets are sent to when they are infused into that NFT. The form is syntactic, the same
+    test the chain applies: fifteen zero bytes, a 0x01 marker, then a nonzero token id and a nonzero
+    instance id. plan_fees uses it to price the recipient's owner lookup."""
+    if address[15] != 1 or any(address[:15]):
+        return False
+    token_id, instance_id = unpack_nft_address(address)
+    return token_id != 0 and instance_id != 0
 
 
 def unpack_nft_instance_id(instance_id: int) -> tuple[int, int]:
