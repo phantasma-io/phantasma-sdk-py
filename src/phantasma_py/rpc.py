@@ -18,7 +18,6 @@ from .carbon import (
     Bytes32,
     GasConfig,
     ModuleID,
-    SignedTxMsg,
     TokenContractMethod,
     TokenInfo,
     TxMsg,
@@ -32,9 +31,7 @@ from .carbon import (
     parse_create_token_result,
     parse_create_token_series_result,
     required_witnesses,
-    serialize,
     sign_and_serialize_tx_msg_with,
-    sign_tx_msg,
 )
 from .crypto import PhantasmaKeys
 from .errors import PreflightError, RPCError
@@ -1695,12 +1692,6 @@ class PhantasmaRPC:
     def sign_and_send_built_transaction(self, tx: Transaction, keys: PhantasmaKeys) -> str:
         tx.sign(keys)
         return self.send_raw_transaction(tx)
-
-    def sign_carbon_transaction(self, msg: TxMsg, keys: PhantasmaKeys) -> SignedTxMsg:
-        return sign_tx_msg(msg, keys)
-
-    def sign_and_send_carbon_transaction(self, msg: TxMsg, keys: PhantasmaKeys) -> str:
-        return self.send_carbon_transaction(serialize(self.sign_carbon_transaction(msg, keys)))
 
     def control_token_id(self) -> int:
         """The gas token's id, which the pre-flight uses as its control lookup: it certainly exists
