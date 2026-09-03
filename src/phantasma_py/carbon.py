@@ -1988,12 +1988,21 @@ class SignedTxMsg:
             TxType.BURN_FUNGIBLE_GAS_PAYER,
             TxType.BURN_NON_FUNGIBLE_GAS_PAYER,
         }:
-            if len(self.witnesses) != 2 or self.witnesses[0].address != self.msg.gas_from:
+            # The chain reads the gas payer's signature first and the owner's second, and resolves
+            # both addresses itself; a wrong order would still decode, so the layout is checked here.
+            if len(self.witnesses) != 2:
+                raise SerializationError("gas-payer transaction expects 2 witnesses")
+            if self.witnesses[0].address != self.msg.gas_from:
                 raise SerializationError("gas witness address mismatch")
+            if self.witnesses[1].address != _payload_from_address(self.msg.msg):
+                raise SerializationError("from witness address mismatch")
             writer.write64(self.witnesses[0].signature)
             writer.write64(self.witnesses[1].signature)
             return
         if self.msg.type in {TxType.CALL, TxType.CALL_MULTI, TxType.TRADE, TxType.PHANTASMA}:
+            # The node refuses a witness-array envelope whose gas payer did not sign.
+            if all(witness.address != self.msg.gas_from for witness in self.witnesses):
+                raise SerializationError("the gas payer must be one of the witnesses")
             writer.write4(len(self.witnesses))
             for witness in self.witnesses:
                 witness.write_carbon(writer)
@@ -2085,6 +2094,73 @@ def _payload_from_address(payload: TxPayload) -> Bytes32:
     ):
         return payload.from_address
     return EMPTY_BYTES32
+
+
+_NATIVE_SINGLE_WITNESS_TYPES = frozenset(
+    {
+        TxType.TRANSFER_FUNGIBLE,
+        TxType.TRANSFER_NON_FUNGIBLE_SINGLE,
+        TxType.TRANSFER_NON_FUNGIBLE_MULTI,
+        TxType.MINT_FUNGIBLE,
+        TxType.BURN_FUNGIBLE,
+        TxType.MINT_NON_FUNGIBLE,
+        TxType.BURN_NON_FUNGIBLE,
+    }
+)
+
+_GAS_PAYER_TYPES = frozenset(
+    {
+        TxType.TRANSFER_FUNGIBLE_GAS_PAYER,
+        TxType.TRANSFER_NON_FUNGIBLE_SINGLE_GAS_PAYER,
+        TxType.TRANSFER_NON_FUNGIBLE_MULTI_GAS_PAYER,
+        TxType.BURN_FUNGIBLE_GAS_PAYER,
+        TxType.BURN_NON_FUNGIBLE_GAS_PAYER,
+    }
+)
+
+
+def required_witnesses(msg: TxMsg) -> list[Bytes32] | None:
+    """The witnesses a message's type fixes, in the order the envelope carries them.
+
+    The native single-witness types are signed by the gas payer alone; the gas-payer types by the
+    gas payer and then the account whose tokens move; a raw Phantasma transaction carries none.
+    Returns None for the witness-array types (Call, CallMulti, Trade, Phantasma), whose witness
+    set the caller chooses - the chain only requires the gas payer to be among them.
+    """
+    if msg.type in _NATIVE_SINGLE_WITNESS_TYPES:
+        return [msg.gas_from]
+    if msg.type in _GAS_PAYER_TYPES:
+        return [msg.gas_from, _payload_from_address(msg.msg)]
+    if msg.type == TxType.PHANTASMA_RAW:
+        return []
+    return None
+
+
+def envelope_bytes(msg: TxMsg, witness_count: int | None = None) -> int:
+    """The size in bytes of a message once signed - the envelope the block carries and gas model v2
+    bills - computed without a key: signatures are fixed-width, so zero-filled placeholder witnesses
+    serialize to exactly the signed length.
+
+    The witness set is the one the message requires; for the witness-array types pass how many
+    witnesses will sign (None sizes one). Every other type fixes its own count, and a stated count
+    must agree with it - a fee kind cannot tell a two-signature gas-payer message from its
+    one-signature form, so a wrong count here would size the envelope 64 bytes short and
+    under-offer the transaction.
+    """
+    required = required_witnesses(msg)
+    if required is not None:
+        if witness_count is not None and witness_count != len(required):
+            raise BuilderError(f"{msg.type.name} carries {len(required)} witness(es), not {witness_count}")
+        addresses = required
+    else:
+        # Placeholder set of a witness-array envelope: the gas payer, which the node requires to be
+        # a witness, then anonymous fillers. Only the count affects the size.
+        count = 1 if witness_count is None else witness_count
+        if count < 1:
+            raise BuilderError(f"{msg.type.name} needs at least one witness, not {count}")
+        addresses = [msg.gas_from] + [EMPTY_BYTES32] * (count - 1)
+    placeholders = SignedTxMsg(msg, [Witness(address, Bytes64()) for address in addresses])
+    return len(serialize(placeholders))
 
 
 def sign_tx_msg(msg: TxMsg, keys: PhantasmaKeys) -> SignedTxMsg:
