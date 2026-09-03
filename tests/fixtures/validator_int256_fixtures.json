@@ -1,9 +1,6 @@
 {
   "generatedFrom": {
-    "authority": "local-validator-runtime",
-    "int256Cpp": "/home/alex/github/pha/pavillion_chain/node_cpp/src/carbon/int256.cpp",
-    "vmCpp": "/home/alex/github/pha/pavillion_chain/node_cpp/src/carbon/contracts/contracts.cpp",
-    "tokenCpp": "/home/alex/github/pha/pavillion_chain/node_cpp/src/carbon/contracts/token.cpp"
+    "authority": "local-validator-runtime"
   },
   "int256": [
     {

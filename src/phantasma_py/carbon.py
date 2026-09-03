@@ -944,10 +944,10 @@ class ChainConfig:
 class GasConfig:
     """On-chain gas configuration (governance module).
 
-    The gas-model-v2 extension fields serialize only for version >= 1, mirroring the node's
-    data_blockchain.h wire format exactly: the version-0 byte image is frozen forever for
-    historical replay, and a version>=1 image truncated to the v0 length fails to parse (the
-    tail read raises on end of stream).
+    The gas-model-v2 extension fields serialize only for version >= 1, mirroring the chain's wire
+    format exactly: the version-0 byte image is frozen forever for historical replay, and a
+    version>=1 image truncated to the v0 length fails to parse (the tail read raises on end of
+    stream).
     """
 
     version: int = 0
