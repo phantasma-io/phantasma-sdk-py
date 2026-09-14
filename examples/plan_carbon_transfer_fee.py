@@ -32,7 +32,8 @@ def main() -> None:
     # options stay empty. A plan of an ordinary token would state recipient_holds_token when known.
     plan = rpc.fees.plan(msg)
     summary = summarize_fee_plan(plan)
-    print(f"Operation: {plan.kind.name}, signed size {plan.envelope_bytes} bytes")
+    operations = ", ".join(kind.name for kind in plan.kinds)
+    print(f"Operations: {operations}, signed size {plan.envelope_bytes} bytes")
     print(f"Gas bill: {summary.gas_bill} KCAL (offer {summary.gas_offer} KCAL)")
     print(f"Storage deposit ceiling: {summary.storage_ceiling} SOUL ({plan.new_storage_quanta} new rows)")
     print("Nothing was signed or sent.")

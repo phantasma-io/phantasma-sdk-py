@@ -158,25 +158,26 @@ symbols follow the Carbon token-module rule of uppercase ASCII letters `A-Z`.
 
 ## Fee planning: build, plan, sign, send
 
-Under gas model v2 every byte a transaction puts in the block is billed and every
-new storage row is escrowed, so the fee of a native operation is a function of
-the message and the chain's prices - and the SDK computes it from the message.
-Builders carry no prices: a message built without a `max_gas` has a zero offer,
-which marks it as unplanned and refuses to sign. The steps are:
+Under gas model v2 the chain bills every byte a transaction puts in the block,
+and it escrows every new storage row. The fee of a native operation is therefore
+a function of the message and the chain's prices, and the SDK computes it from
+the message. Builders carry no prices. A message built without a `max_gas` has a
+zero offer, which marks it as unplanned and refuses to sign. The steps are:
 
 1. **Build** the message with a builder (`build_transfer_fungible_tx`,
    `build_create_token_tx`, `build_mint_phantasma_non_fungible_tx`, ...). The
    builders write only the limits you pass (`TxLimits`).
 2. **Plan** it against the chain: `rpc.fees.plan(msg)` reads the chain's gas
    config through the client (cached for a minute), recognises the operation and
-   prices it. For every operation the SDK models the bill is exact for the facts
-   it was given; a chain-state fact the message does not carry - whether the
-   recipient already holds the token, whether the series is duplicated - defaults
-   to the reading that costs more, so an unstated plan is an upper bound the
-   settlement can only undercut, and the unused part of the offer is refunded.
-   State what you know in `PlanRequestOptions` to get the exact quote. A burn of
-   an NFT is planned for what the NFT holds: the client reads the NFT's address
-   for you; the pure `plan_fees` demands the list instead.
+   prices it. For every operation the SDK models, the bill is exact for the facts
+   it was given. Some of the price depends on chain state the message does not
+   carry. Examples are whether the recipient already holds the token, and which
+   mode a series mints in. Each such fact is taken at the value that costs MORE,
+   so an unstated plan is an upper bound the settlement can only undercut, and
+   the unused part of the offer is refunded. State what you know in
+   `PlanRequestOptions` to get the exact quote. A burn of an NFT is planned for
+   what the NFT holds: the client reads the NFT's address for you, and the pure
+   `plan_fees` demands the list.
 3. **Sign** with every witness the message needs: `sign_tx_msg(planned, *keys)`
    for in-memory keys, `sign_tx_msg_with(planned, *signers)` for a `TxSigner`
    such as a hardware wallet. A gas-payer transfer takes the payer's and the
@@ -184,10 +185,10 @@ which marks it as unplanned and refuses to sign. The steps are:
 4. **Send** the envelope with `rpc.send_carbon_transaction(raw)`.
 
 `rpc.send_transaction(msg, signers)` does all four in one step, plus a
-pre-flight: a token creation pays its policy fee before the chain looks at the
+pre-flight. A token creation pays its policy fee before the chain looks at the
 symbol, so the client asks whether the symbol is taken and refuses to send
 unless the chain answered that it is free. `rpc.preflight_transaction(msg)`
-reports that verdict to callers who want to decide for themselves.
+reports that verdict to callers that want to decide for themselves.
 
 ```python
 from phantasma_py import PhantasmaRPC, build_transfer_fungible_tx, summarize_fee_plan
@@ -211,20 +212,51 @@ print(f"gas {summary.gas_bill} KCAL, storage deposit up to {summary.storage_ceil
 tx_hash = rpc.send_transaction(msg, [keys])
 ```
 
+### Which fact each operation reads
+
+Only the facts an operation reads can move its price, so this table is the whole
+of what is worth stating. Every default is the reading that costs MORE. One
+storage quantum is `data_escrow_per_row` of escrow plus 25 gas units of block
+data, and the chain's `fee_multiplier` scales both. Balance rows of the gas and
+data tokens are free, so for those tokens `recipient_holds_token` changes
+nothing.
+
+| `NativeFeeKind` | facts it reads | what the default assumes | what the default costs |
+|---|---|---|---|
+| `TRANSFER_FUNGIBLE` | `recipient_holds_token` | the recipient has no row for this token | 1 quantum |
+| `TRANSFER_NON_FUNGIBLE` | `recipient_holds_token` | the recipient has no row for this token | 1 quantum |
+| `MINT_FUNGIBLE` | `recipient_holds_token`, `supply_row_exists`, `big_fungible` | no recipient row; the supply row was dropped and must be recreated; the resulting balance needs the widest answer | 1 quantum each, and 24 more result bytes (33 against 9) |
+| `BURN_FUNGIBLE` | `token_burned_before`, `supply_row_exists`, `big_fungible` | the token's burnt counter does not exist yet; the supply row must be recreated; widest answer | 1 quantum each, and 24 more result bytes |
+| `MINT_NON_FUNGIBLE` | `recipient_holds_token`, `supply_row_exists`, `rom_has_meta_id` | as above, plus: the ROM carries an `_i` id, which is indexed in one more row | 1 quantum each, and 1 quantum per instance for the id |
+| `MINT_PHANTASMA_NON_FUNGIBLE` | `recipient_holds_token`, `supply_row_exists`, `duplicated_series` | as above, plus: the series mints duplicates | 1 quantum each, and one query fee per instance plus one per distinct series |
+| `BURN_NON_FUNGIBLE` | `token_burned_before`, `supply_row_exists`, **`infusions` (required)** | burnt counter does not exist; supply row must be recreated | 1 quantum each. `infusions` has no default at all. A burn returns whatever the NFT holds, and there is no upper bound on that, so the plan demands the list and `rpc.fees` reads it from the chain. `rom_has_meta_id` is read here too but cannot move the bill: a burn deletes more rows than it creates, so its net storage growth is zero either way |
+| `CREATE_TOKEN` | none | nothing is assumed | the price comes entirely from the message: the symbol length, the serialized `TokenInfo`, and which keys its metadata carries |
+| `CREATE_TOKEN_SERIES` | `series_has_meta_id` | the series metadata carries an `_i` id | 1 quantum |
+| `REGISTER_NAME` | none | nothing is assumed | governance rows are free data; the price is the length-shifted policy fee and the envelope |
+| `SCRIPT` | none | 5000 work units, 512 event bytes and 4 storage quanta, per unmodelled call | a budget and never a prediction |
+
 Notes:
 
-- `summarize_fee_plan` renders a plan in KCAL and SOUL; `plan.apply(msg)` returns
+- `plan.kinds` says which operations were priced. A `CALL_MULTI` performs
+  several, and each one is priced and then summed, because the chain bills a
+  batch as the sum of its calls with the envelope counted once. One kind is a
+  budget and not a formula: `NativeFeeKind.SCRIPT`, which covers VM scripts and
+  calls the SDK does not model. Their work depends on execution.
+- `burned_instances(msg)` names the NFT instances a message burns, in any shape.
+  It covers the native burn types, a `Token.BurnNonFungible` call, and every such
+  call inside a `CALL_MULTI`. Use it to tell whether `infusions` is required. An
+  empty answer means the list is not required.
+- `summarize_fee_plan` renders a plan in KCAL and SOUL. `plan.apply(msg)` returns
   the message with the plan written in when you sign yourself.
 - A message keeps a default lifetime of 45 seconds. When a person sits between
-  building and signing, set `TxLimits.expiry` from the chain's own window:
+  building and signing, set `TxLimits.expiry` from the chain's own window with
   `expiry_within(rpc.fees.chain_params().expiry_window_ms)`.
 - Calls whose witness set the caller chooses (token creation, series creation,
-  Phantasma mints, name registration) need `witness_count` in the plan options;
-  `send_transaction` and the `build_*_tx_and_sign` helpers fill it in from the
-  signers they are given.
-- Scripts and calls the SDK does not model are planned as a budget
-  (`NativeFeeKind.SCRIPT`), not a formula; the node's `estimate_transaction`
-  gives their exact bill.
+  Phantasma mints, name registration, and every batch) need `witness_count` in
+  the plan options. `send_transaction` and the `build_*_tx_and_sign` helpers fill
+  it in from the signers they are given.
+- The node's `estimate_transaction` gives the exact bill of a script, which the
+  SDK can only budget.
 - A node that refuses a request with an HTTP error and a JSON-RPC body surfaces
   the body as an `RPCError` with the node's code and message, so the node's
   refusal is told from a transport failure.

@@ -14,6 +14,7 @@ from phantasma_py import (
     InfusedAsset,
     NativeFeeKind,
     NativeFeeParams,
+    burned_instances,
     estimate_native_fee,
     plan_fees,
 )
@@ -53,6 +54,14 @@ from phantasma_py.carbon import (
 )
 from phantasma_py.crypto import PhantasmaKeys
 from phantasma_py.errors import BuilderError
+
+
+def only_kind(plan: FeePlan) -> NativeFeeKind:
+    """The single operation a plan priced. A plan that priced none or several is a test that asked
+    the wrong question, so it fails here rather than further down."""
+    assert len(plan.kinds) == 1, f"expected one priced operation, got {plan.kinds}"
+    return plan.kinds[0]
+
 
 ICON = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
@@ -131,7 +140,7 @@ ONE_WITNESS = FeePlanOptions(witness_count=1)
 def test_plans_a_native_transfer_from_the_message() -> None:
     msg = transfer(RECEIVER, 1)
     plan = plan_fees(msg, config())
-    assert plan.kind is NativeFeeKind.TRANSFER_FUNGIBLE
+    assert only_kind(plan) is NativeFeeKind.TRANSFER_FUNGIBLE
     assert plan.envelope_bytes == envelope_bytes(msg) == 170
     assert plan.expected_gas_bill == 42_600_000
     assert plan.max_gas == 42_600_000
@@ -185,7 +194,7 @@ def test_reads_a_token_creation_out_of_its_call() -> None:
     fungible = create_token("PLANNED", False)
     assert isinstance(fungible.msg, TxMsgCall)
     plan = plan_fees(fungible, config(), ONE_WITNESS)
-    assert plan.kind is NativeFeeKind.CREATE_TOKEN
+    assert only_kind(plan) is NativeFeeKind.CREATE_TOKEN
     direct = estimate_native_fee(
         NativeFeeKind.CREATE_TOKEN,
         config(),
@@ -218,7 +227,7 @@ def test_reads_a_series_creation_out_of_its_call() -> None:
     msg = build_create_token_series_tx(9, info, CREATOR, TxLimits(expiry=EXPIRY))
     assert isinstance(msg.msg, TxMsgCall)
     plan = plan_fees(msg, config(), FeePlanOptions(witness_count=1, series_has_meta_id=True))
-    assert plan.kind is NativeFeeKind.CREATE_TOKEN_SERIES
+    assert only_kind(plan) is NativeFeeKind.CREATE_TOKEN_SERIES
     direct = estimate_native_fee(
         NativeFeeKind.CREATE_TOKEN_SERIES,
         config(),
@@ -235,7 +244,7 @@ def test_reads_a_series_creation_out_of_its_call() -> None:
 def test_reads_a_phantasma_mint_out_of_its_call() -> None:
     options = FeePlanOptions(witness_count=1, duplicated_series=True, supply_row_exists=True)
     one_series = plan_fees(phantasma_mint([5, 5, 5], 75, RECEIVER), config(), options)
-    assert one_series.kind is NativeFeeKind.MINT_PHANTASMA_NON_FUNGIBLE
+    assert only_kind(one_series) is NativeFeeKind.MINT_PHANTASMA_NON_FUNGIBLE
     three_series = plan_fees(phantasma_mint([5, 6, 7], 75, RECEIVER), config(), options)
     assert three_series.envelope_bytes == one_series.envelope_bytes
     assert three_series.expected_gas_bill - one_series.expected_gas_bill == 2 * 10 * 10_000, (
@@ -269,7 +278,7 @@ def test_reads_a_native_nft_mint_out_of_the_message() -> None:
         TxType.MINT_NON_FUNGIBLE, CREATOR, TxMsgMintNonFungible(7, RECEIVER, 1, bytes([1]) * 1100, bytes([2]) * 30)
     )
     plan = plan_fees(msg, config())
-    assert plan.kind is NativeFeeKind.MINT_NON_FUNGIBLE
+    assert only_kind(plan) is NativeFeeKind.MINT_NON_FUNGIBLE
     direct = estimate_native_fee(
         NativeFeeKind.MINT_NON_FUNGIBLE,
         config(),
@@ -287,7 +296,7 @@ def test_counts_the_instances_of_a_multi_transfer() -> None:
         )
 
     plan = plan_fees(multi([1, 2]), config())
-    assert plan.kind is NativeFeeKind.TRANSFER_NON_FUNGIBLE
+    assert only_kind(plan) is NativeFeeKind.TRANSFER_NON_FUNGIBLE
     assert plan.deleted_storage_quanta == 2
     assert plan.new_storage_quanta == 3
     with pytest.raises(BuilderError, match="at least one instance"):
@@ -301,7 +310,7 @@ def test_demands_what_a_burned_nft_holds() -> None:
     with pytest.raises(BuilderError, match="infusions"):
         plan_fees(msg, config())
     empty = plan_fees(msg, config(), FeePlanOptions(infusions=[]))
-    assert empty.kind is NativeFeeKind.BURN_NON_FUNGIBLE
+    assert only_kind(empty) is NativeFeeKind.BURN_NON_FUNGIBLE
     infused = plan_fees(msg, config(), FeePlanOptions(infusions=[InfusedAsset(token_id=1)]))
     assert infused.expected_gas_bill - empty.expected_gas_bill == 20 * 10_000
 
@@ -320,10 +329,15 @@ def test_budgets_unmodelled_calls_as_scripts_and_refuses_raw_transactions() -> N
     unknown = base_tx(TxType.CALL, CREATOR, TxMsgCall(ModuleID.TOKEN, 999, bytes(40)))
     options = FeePlanOptions(witness_count=1, script_storage_quanta=0)
     plan = plan_fees(unknown, config(), options)
-    assert plan.kind is NativeFeeKind.SCRIPT
+    assert only_kind(plan) is NativeFeeKind.SCRIPT
     assert plan.expected_gas_bill == (5000 + (plan.envelope_bytes + 512) * 25) * 10_000
+    # A batch with no calls performs no operation, so nothing is priced and the bill is the envelope
+    # alone. The same reading of an empty call list is what burned_instances takes.
     multi = base_tx(TxType.CALL_MULTI, CREATOR, TxMsgCallMulti([]))
-    assert plan_fees(multi, config(), options).kind is NativeFeeKind.SCRIPT
+    empty = plan_fees(multi, config(), options)
+    assert empty.kinds == ()
+    assert empty.expected_gas_bill == empty.envelope_bytes * 25 * 10_000
+    assert burned_instances(multi) == []
 
 
 # RegisterName is a governance call whose arguments the plan reads for the name length.
@@ -333,7 +347,7 @@ def test_reads_a_name_registration_out_of_its_call() -> None:
     assert deserialize(encoded, RegisterNameArgs) == args
     msg = base_tx(TxType.CALL, CREATOR, TxMsgCall(ModuleID.GOVERNANCE, GovernanceContractMethod.REGISTER_NAME, encoded))
     plan = plan_fees(msg, config(), FeePlanOptions(witness_count=2))
-    assert plan.kind is NativeFeeKind.REGISTER_NAME
+    assert only_kind(plan) is NativeFeeKind.REGISTER_NAME
     direct = estimate_native_fee(
         NativeFeeKind.REGISTER_NAME, config(), NativeFeeParams(envelope_bytes=plan.envelope_bytes, name_length=12)
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from phantasma_py import FeePlan, FeePlanSummary, NativeFeeKind, summarize_fee_plan, summarize_fee_plan_with_decimals
 
 PLAN = FeePlan(
-    kind=NativeFeeKind.TRANSFER_FUNGIBLE,
+    kinds=(NativeFeeKind.TRANSFER_FUNGIBLE,),
     envelope_bytes=170,
     max_gas=42_850_000,
     max_data=200_000,

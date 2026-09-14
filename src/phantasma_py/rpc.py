@@ -21,8 +21,6 @@ from .carbon import (
     TokenContractMethod,
     TokenInfo,
     TxMsg,
-    TxMsgBurnNonFungible,
-    TxMsgBurnNonFungibleGasPayer,
     TxMsgCall,
     TxSigner,
     TxType,
@@ -42,6 +40,7 @@ from .fees import (
     FeePlanOptions,
     FeeQuote,
     InfusedAsset,
+    burned_instances,
     plan_fees,
 )
 from .transaction import Transaction, tx_state_is_fault, tx_state_is_success
@@ -857,7 +856,7 @@ class ChainFeeParams:
     describe the node's admission rules rather than its prices, and arrive in the same getGasConfig
     answer."""
 
-    #: The longest lifetime the chain admits for a transaction, in milliseconds - it refuses an
+    #: The longest lifetime the chain admits for a transaction, in milliseconds. The chain refuses an
     #: expiry at or beyond now + expiry_window_ms. Feed it to expiry_within when a person sits
     #: between building a transaction and signing it.
     expiry_window_ms: int
@@ -962,23 +961,31 @@ class FeePlanner:
         return plan_fees(msg, config, self._with_infusions(msg, options.facts))
 
     def plan_with(self, config: GasConfig, msg: TxMsg, options: FeePlanOptions | None = None) -> FeePlan:
-        """Plans a message against a config the caller already holds - no network, no cache."""
+        """Plans a message against a config the caller already holds. It touches no network and no
+        cache."""
         return plan_fees(msg, config, options)
 
     def _with_infusions(self, msg: TxMsg, facts: FeePlanOptions) -> FeePlanOptions:
-        # Fills in what a burned NFT holds. A burn returns whatever the NFT's own address holds, and
-        # the chain charges for each returned asset. That set is chain state the message does not
-        # carry and has no costlier bound, so the pure planner demands it; here, with a chain to
-        # ask, it is read unless the caller stated it (an empty list states that the NFT holds
-        # nothing).
+        # Fills in what the burned NFTs hold. A burn returns whatever the NFT's own address holds,
+        # and the chain charges for each returned asset. That set is chain state the message does not
+        # carry, and it has no costlier bound, so the pure planner demands it. Here there is a chain
+        # to ask, so it is read unless the caller stated it. An empty list states that the NFTs hold
+        # nothing.
+        #
+        # A message may burn several instances. A wallet burning a selection sends a CALL_MULTI of
+        # burns. Each instance is read at its own address, because the fee follows every returned
+        # asset separately.
         if facts.infusions is not None:
             return facts
-        if not isinstance(msg.msg, TxMsgBurnNonFungible | TxMsgBurnNonFungibleGasPayer):
+        burned = burned_instances(msg)
+        if not burned:
             return facts
-        try:
-            infusions = self._client.infused_assets(msg.msg.token_id, msg.msg.instance_id)
-        except RPCError as exc:
-            raise RPCError(f"reading what the burned NFT holds: {exc}", code=exc.code, data=exc.data) from exc
+        infusions: list[InfusedAsset] = []
+        for instance in burned:
+            try:
+                infusions.extend(self._client.infused_assets(instance.token_id, instance.instance_id))
+            except RPCError as exc:
+                raise RPCError(f"reading what the burned NFT holds: {exc}", code=exc.code, data=exc.data) from exc
         return replace(facts, infusions=infusions)
 
     def _read(self, refresh: bool) -> _CachedGasConfig:
