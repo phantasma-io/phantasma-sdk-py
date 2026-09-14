@@ -6,6 +6,7 @@ from phantasma_py import FeePlan, FeePlanSummary, NativeFeeKind, summarize_fee_p
 
 PLAN = FeePlan(
     kinds=(NativeFeeKind.TRANSFER_FUNGIBLE,),
+    exact=True,
     envelope_bytes=170,
     max_gas=42_850_000,
     max_data=200_000,

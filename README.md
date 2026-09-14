@@ -233,7 +233,7 @@ nothing.
 | `CREATE_TOKEN` | none | nothing is assumed | the price comes entirely from the message: the symbol length, the serialized `TokenInfo`, and which keys its metadata carries |
 | `CREATE_TOKEN_SERIES` | `series_has_meta_id` | the series metadata carries an `_i` id | 1 quantum |
 | `REGISTER_NAME` | none | nothing is assumed | governance rows are free data; the price is the length-shifted policy fee and the envelope |
-| `SCRIPT` | none | 5000 work units, 512 event bytes and 4 storage quanta, per unmodelled call | a budget and never a prediction |
+| `SCRIPT` | none | 5000 work units, 512 event bytes and 4 storage quanta, per unmodelled call | a budget and never a prediction. `plan.exact` is `False` whenever one is present |
 
 Notes:
 
@@ -242,6 +242,15 @@ Notes:
   batch as the sum of its calls with the envelope counted once. One kind is a
   budget and not a formula: `NativeFeeKind.SCRIPT`, which covers VM scripts and
   calls the SDK does not model. Their work depends on execution.
+- `plan.exact` says whether the number is a prediction or a ceiling. It is `True`
+  when nothing the plan had to assume could have changed it. It is `False` when a
+  costlier reading decided part of the price, or when a part of the message had
+  to be budgeted. A wallet shows the amount when the flag is `True`, and "up to"
+  in front of the amount when it is `False`. The flag is answered by pricing the
+  message a second time with every fact at its cheaper reading, so it is about
+  THIS message and not about which options you set. A KCAL transfer is exact with
+  nothing stated, because the chain's own token rows are free and
+  `recipient_holds_token` cannot move its price.
 - `burned_instances(msg)` names the NFT instances a message burns, in any shape.
   It covers the native burn types, a `Token.BurnNonFungible` call, and every such
   call inside a `CALL_MULTI`. Use it to tell whether `infusions` is required. An

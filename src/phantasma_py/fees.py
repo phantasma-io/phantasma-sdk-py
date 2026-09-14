@@ -861,6 +861,22 @@ class FeePlan:
     #:
     #: This field says what was priced. How firm the number is, FeePlan.exact answers.
     kinds: tuple[NativeFeeKind, ...]
+    #: True when this bill is a prediction of the settlement, False when it is an upper bound on it.
+    #: A wallet showing a fee reads this one field to choose between "0.0073 KCAL" and "up to 0.0073
+    #: KCAL".
+    #:
+    #: The field is False in two cases. A chain-state fact was left at its costlier reading and that
+    #: reading decided part of the price. Or some part of the message had to be budgeted.
+    #:
+    #: recipient_holds_token, token_burned_before and supply_row_exists are plain bools whose False
+    #: is the costlier reading, so a caller that states the costlier value and a caller that states
+    #: nothing arrive here the same way, and both get a bound. Stating a costlier fact buys nothing,
+    #: so nothing is lost by that.
+    #:
+    #: big_fungible is flipped even when the caller stated it. It claims nothing about chain state:
+    #: it asks the model to price the widest answer a variable-length balance can have. A plan that
+    #: rests on it reports False however it was arrived at.
+    exact: bool
     #: The signed size the plan was computed for. These are the bytes the block will carry.
     envelope_bytes: int
     #: See FeeQuote.max_gas.
@@ -934,14 +950,56 @@ def plan_fees(msg: TxMsg, config: GasConfig, options: FeePlanOptions | None = No
     transaction = NativeFeeTransactionParams(envelope_bytes=envelope_bytes(msg, options.witness_count))
     estimate = estimate_native_fee_batch(parts, config, transaction)
     kinds = tuple(part.kind for part in parts)
+    budgeted = NativeFeeKind.SCRIPT in kinds
+    exact = not budgeted and not _assumptions_mattered(msg, config, options, transaction, estimate)
     return FeePlan(
         kinds=kinds,
+        exact=exact,
         envelope_bytes=transaction.envelope_bytes,
         max_gas=estimate.max_gas,
         max_data=estimate.max_data,
         expected_gas_bill=estimate.expected_gas_bill,
         new_storage_quanta=estimate.new_storage_quanta,
         deleted_storage_quanta=estimate.deleted_storage_quanta,
+    )
+
+
+def _assumptions_mattered(
+    msg: TxMsg,
+    config: GasConfig,
+    options: FeePlanOptions,
+    transaction: NativeFeeTransactionParams,
+    quoted: NativeFeeEstimate,
+) -> bool:
+    # Whether a fact left at its costlier reading changed this quote.
+    #
+    # The message is priced a second time, with every state fact at its CHEAPER reading. The two
+    # quotes are then compared. If they agree, the costlier readings decided nothing and the bill is
+    # a prediction.
+    #
+    # The question is asked this way to keep ONE definition of which facts an operation reads: the
+    # operation models themselves. A list written here would drift from them as the models change.
+    #
+    # The answer is also per message, not per kind. That matters. A gas-token transfer does not
+    # depend on recipient_holds_token at all, because the chain's own rows are free. A plan that
+    # reported the fact as assumed would send every ordinary transfer to the "up to" branch.
+    #
+    # infusions is not flipped. It has no cheaper reading, and the planner demands it.
+    cheapest = dataclasses.replace(
+        options,
+        recipient_holds_token=True,
+        token_burned_before=True,
+        supply_row_exists=True,
+        big_fungible=False,
+        rom_has_meta_id=bool(options.rom_has_meta_id),
+        series_has_meta_id=bool(options.series_has_meta_id),
+        duplicated_series=bool(options.duplicated_series),
+    )
+    cheaper = estimate_native_fee_batch(_describe(msg, cheapest), config, transaction)
+    return (
+        cheaper.expected_gas_bill != quoted.expected_gas_bill
+        or cheaper.max_gas != quoted.max_gas
+        or cheaper.max_data != quoted.max_data
     )
 
 
