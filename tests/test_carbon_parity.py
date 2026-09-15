@@ -49,7 +49,7 @@ from phantasma_py.carbon import (
     unpack_nft_instance_id,
 )
 from phantasma_py.crypto import PhantasmaKeys
-from phantasma_py.errors import BuilderError
+from phantasma_py.errors import BuilderError, SerializationError
 from phantasma_py.fees import PlanAndSignOptions
 
 CARBON_TX_BUILDER_FIXTURE_SHA256 = "efcb2d237ffd2ca3178b8c3b3106c7d035bc0f5e05959abb135163d637c3b11d"
@@ -235,6 +235,25 @@ def test_carbon_tx_builders_match_golden_vectors(case_id: str, source: str, expe
     if not case_id.startswith("signed_"):
         decoded = deserialize(bytes.fromhex(expected_hex), TxMsg)
         assert serialize(decoded).hex().upper() == expected_hex, case_id
+
+
+@pytest.mark.parametrize(
+    "case_id,source,expected_hex,notes", fixture_rows("tests/fixtures/carbon_tx_builder_vectors.tsv")
+)
+def test_carbon_tx_truncated_messages_are_refused(case_id: str, source: str, expected_hex: str, notes: str) -> None:
+    """Every prefix of a valid message has to be refused.
+
+    A prefix cuts a field the reader still needs, so a reader that cannot report the end of the
+    stream accepts it and hands back fields it never read. The C++ SDK had exactly that defect, and
+    this is the test that found it. Signed cases carry a signature after the message, so a prefix of
+    one can be a whole message and is not a truncation.
+    """
+    if case_id.startswith("signed_"):
+        pytest.skip("a signed envelope's prefix can be a complete message")
+    data = bytes.fromhex(expected_hex)
+    for length in range(len(data)):
+        with pytest.raises(SerializationError):
+            deserialize(data[:length], TxMsg)
 
 
 def _carbon_tx_builder_vector(case_id: str) -> str:
