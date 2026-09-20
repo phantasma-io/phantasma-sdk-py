@@ -15,6 +15,7 @@ import requests
 
 from ._wire_shapes import snake_to_camel
 from .carbon import (
+    DEFAULT_TX_EXPIRY_MS,
     Bytes32,
     GasConfig,
     ModuleID,
@@ -1691,8 +1692,18 @@ class PhantasmaRPC:
         *,
         expiration: int | None = None,
     ) -> str:
+        """Build, sign and broadcast a classic VM transaction.
+
+        ``expiration`` is a unix time in seconds. It defaults to :data:`DEFAULT_TX_EXPIRY_MS` from
+        now, the same lifetime a Carbon transaction gets: the chain admits both kinds of transaction
+        with the same check against its own expiry window. A flow with a person in it should take
+        that window instead, see :func:`expiry_within`.
+        """
         raw_payload = payload.encode("utf-8") if isinstance(payload, str) else payload
-        tx = Transaction(nexus, chain, script, expiration or int(time.time()) + 20 * 60, raw_payload)
+        # This transaction carries its expiration in seconds, while the Carbon default counts in
+        # milliseconds.
+        expiration = expiration or int(time.time()) + DEFAULT_TX_EXPIRY_MS // 1000
+        tx = Transaction(nexus, chain, script, expiration, raw_payload)
         tx.sign(keys)
         return self.send_raw_transaction(tx)
 

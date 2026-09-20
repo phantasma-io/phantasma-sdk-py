@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from _canned_node import (
     OWNER,
@@ -25,7 +27,7 @@ from phantasma_py import (
     SendTransactionOptions,
     plan_fees,
 )
-from phantasma_py.carbon import get_nft_address
+from phantasma_py.carbon import DEFAULT_TX_EXPIRY_MS, get_nft_address
 
 
 def test_plans_an_unplanned_message_signs_it_and_broadcasts_the_envelope() -> None:
@@ -188,3 +190,25 @@ def test_surfaces_a_broadcast_rejection_as_an_error() -> None:
     node.send_error = "mempool full"
     with pytest.raises(RPCError, match="mempool full"):
         node.client().send_transaction(transfer_tx(OWNER, PAYER), [OWNER_KEYS])
+
+
+# A chain refuses an expiry at or beyond its own window, and that window can be as short as the node
+# default. Both transaction paths are admitted by that same check, so they stamp the same lifetime.
+# The classic transaction counts in seconds while the Carbon default counts in milliseconds.
+def test_script_transaction_stamps_the_carbon_default_lifetime() -> None:
+    node = CannedNode()
+    lifetime = DEFAULT_TX_EXPIRY_MS // 1000
+
+    before = int(time.time())
+    assert node.client().sign_and_send_transaction(OWNER_KEYS, "simnet", b"\x0d\x00\x0b") == "HASH"
+    after = int(time.time())
+
+    assert before + lifetime <= node.decode_sent_transaction().expiration <= after + lifetime
+
+
+def test_script_transaction_keeps_the_expiration_the_caller_passes() -> None:
+    node = CannedNode()
+
+    node.client().sign_and_send_transaction(OWNER_KEYS, "simnet", b"\x0d\x00\x0b", expiration=1_900_000_000)
+
+    assert node.decode_sent_transaction().expiration == 1_900_000_000

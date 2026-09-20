@@ -29,6 +29,7 @@ from phantasma_py.carbon import (
 )
 from phantasma_py.crypto import PhantasmaKeys
 from phantasma_py.rpc import PhantasmaRPC
+from phantasma_py.transaction import Transaction
 
 # The getGasConfig response of the mainnet gas-model-v2 configuration (special resolution #79).
 MAINNET_GAS_CONFIG: dict[str, Any] = {
@@ -115,6 +116,11 @@ class CannedNode:
         assert isinstance(decoded, SignedTxMsg)
         return decoded
 
+    def decode_sent_transaction(self) -> Transaction:
+        """The classic VM transaction the broadcast was given, decoded back from the wire."""
+        assert self.sent, "nothing was sent"
+        return Transaction.from_bytes(bytes.fromhex(self.sent[0]))
+
     def post(
         self,
         url: str,
@@ -152,7 +158,7 @@ class CannedNode:
             if token is None:
                 raise _NodeError(self.lookup_error)
             return token
-        if method == "sendCarbonTransaction":
+        if method in ("sendCarbonTransaction", "sendRawTransaction"):
             if self.send_error is not None:
                 raise _NodeError(self.send_error)
             self.sent.append(params[0])
