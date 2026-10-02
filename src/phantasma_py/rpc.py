@@ -1296,9 +1296,9 @@ class PhantasmaRPC:
 
         Returns the settled bill plus recommended maxGas/maxData ceilings. Signatures inside the
         envelope may be zero-filled dummies of the correct length - the simulation skips signature
-        checks, and dummies preserve the exact envelope byte length the bill depends on. Until the
-        estimate service is launched this raises a standard RPCError; use estimate_native_fee()
-        with get_gas_config() as the fallback.
+        checks, and dummies preserve the exact envelope byte length the bill depends on. This
+        raises a standard RPCError on a node with the estimate service switched off.
+        rpc.fees.plan(msg) plans a fee without that service.
         """
         return _decode_dataclass(EstimateTransactionResult, self.call("estimateTransaction", tx_data))
 
