@@ -2257,7 +2257,7 @@ def sign_tx_msg_with(msg: TxMsg, *signers: TxSigner) -> SignedTxMsg:
 
     One account can fill two witness slots, when it pays the gas and owns the tokens. Such a signer
     is asked once and its signature is reused."""
-    _assert_planned(msg)
+    _assert_signable(msg)
     addresses = [bytes32_from_public_key(signer.public_key) for signer in signers]
     slots = _witness_slots(msg, addresses)
     message = serialize(msg)
@@ -2274,12 +2274,31 @@ def sign_and_serialize_tx_msg_with(msg: TxMsg, *signers: TxSigner) -> bytes:
     return serialize(sign_tx_msg_with(msg, *signers))
 
 
-def _assert_planned(msg: TxMsg) -> None:
-    # A zero gas offer is never admissible, so it marks a message that was built but not planned;
-    # signing it would only produce a rejection. Plan with PhantasmaRPC.fees / plan_fees, or set
-    # max_gas deliberately.
+def _assert_signable(msg: TxMsg) -> None:
+    # Refuses, before anything is signed, a message the chain is certain to refuse.
+    #
+    # A zero gas offer is never admissible, so it marks a message that was built but not planned.
+    # Plan with PhantasmaRPC.fees / plan_fees, or set max_gas deliberately.
     if msg.max_gas == 0:
         raise BuilderError("transaction has no gas offer: plan its fees or set max_gas before signing")
+    # A native fungible transfer carries its amount as a u64, and the chain reads it as a signed
+    # 64-bit value. An amount of 2^63 or more fails on chain for every fungible token, big-fungible
+    # ones included, and the failed transaction is billed. A larger amount needs a
+    # Token.TransferFungible module call or a script transfer.
+    amount = _native_transfer_amount(msg)
+    if amount is not None and amount >= 1 << 63:
+        raise BuilderError(
+            f"transfer amount {amount} is above the int64 maximum the chain accepts in a native transfer"
+        )
+
+
+def _native_transfer_amount(msg: TxMsg) -> int | None:
+    # Returns the amount of a native fungible transfer, and None for every other message.
+    if msg.type == TxType.TRANSFER_FUNGIBLE and isinstance(msg.msg, TxMsgTransferFungible):
+        return msg.msg.amount
+    if msg.type == TxType.TRANSFER_FUNGIBLE_GAS_PAYER and isinstance(msg.msg, TxMsgTransferFungibleGasPayer):
+        return msg.msg.amount
+    return None
 
 
 def _witness_slots(msg: TxMsg, addresses: list[Bytes32]) -> list[tuple[Bytes32, int]]:

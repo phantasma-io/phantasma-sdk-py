@@ -143,6 +143,35 @@ def test_an_unplanned_message_is_refused() -> None:
         sign_tx_msg(native_transfer(PAYER, OWNER, 0), PAYER_KEYS)
 
 
+# The chain reads a native transfer amount as a signed 64-bit value, so 2^63 fails on chain and the
+# int64 maximum does not. Both transfer types and both signing paths refuse it before anything is
+# signed.
+def test_a_native_transfer_above_the_int64_maximum_is_refused() -> None:
+    int64_max = (1 << 63) - 1
+
+    def plain(amount: int) -> TxMsg:
+        return TxMsg(
+            TxType.TRANSFER_FUNGIBLE, 1, 42_600_000, 0, PAYER, SmallString(""), TxMsgTransferFungible(OWNER, 1, amount)
+        )
+
+    def with_gas_payer(amount: int) -> TxMsg:
+        msg = gas_payer_transfer(PAYER, OWNER)
+        msg.msg.amount = amount
+        return msg
+
+    with pytest.raises(BuilderError, match="int64 maximum"):
+        sign_tx_msg(plain(int64_max + 1), PAYER_KEYS)
+    with pytest.raises(BuilderError, match="int64 maximum"):
+        sign_tx_msg(with_gas_payer(int64_max + 1), PAYER_KEYS, OWNER_KEYS)
+    signer = CountingSigner(PAYER_KEYS)
+    with pytest.raises(BuilderError, match="int64 maximum"):
+        sign_tx_msg_with(plain(int64_max + 1), signer)
+    assert signer.calls == 0
+
+    assert len(sign_tx_msg(plain(int64_max), PAYER_KEYS).witnesses) == 1
+    assert len(sign_tx_msg(with_gas_payer(int64_max), PAYER_KEYS, OWNER_KEYS).witnesses) == 2
+
+
 # The single-witness path keeps its historical behaviour and is the same signature the signer
 # protocol produces.
 def test_the_single_witness_path_still_signs_the_historical_way() -> None:
