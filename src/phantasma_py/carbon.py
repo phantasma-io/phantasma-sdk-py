@@ -2282,10 +2282,12 @@ def _assert_signable(msg: TxMsg) -> None:
     if msg.max_gas == 0:
         raise BuilderError("transaction has no gas offer: plan its fees or set max_gas before signing")
     # A native fungible transfer carries its amount as a u64, and the chain reads it as a signed
-    # 64-bit value. An amount of 2^63 or more fails on chain for every fungible token, big-fungible
-    # ones included, and the failed transaction is billed. A larger amount needs a
-    # Token.TransferFungible module call or a script transfer.
+    # 64-bit value that must be above zero. Zero, and an amount of 2^63 or more, fail on chain for
+    # every fungible token, big-fungible ones included, and the failed transaction is billed. A
+    # larger amount needs a Token.TransferFungible module call or a script transfer.
     amount = _native_transfer_amount(msg)
+    if amount is not None and amount <= 0:
+        raise BuilderError("transfer amount must be above zero for a native transfer")
     if amount is not None and amount >= 1 << 63:
         raise BuilderError(
             f"transfer amount {amount} is above the int64 maximum the chain accepts in a native transfer"
@@ -2420,8 +2422,8 @@ def build_transfer_fungible_tx(
     from_address is the account whose tokens move (always a witness); gas_payer is a different
     account that pays the gas and becomes the first witness (None = the sender pays); amount is in
     the token's atoms. A big-fungible token moves this way too. The chain reads the amount as a
-    signed 64-bit value, so it refuses one above the int64 maximum. A larger amount needs a
-    Token.TransferFungible module call or a script transfer, whose amounts are big integers.
+    signed 64-bit value, so it refuses zero and anything above the int64 maximum. A larger amount
+    needs a Token.TransferFungible module call or a script transfer, whose amounts are big integers.
     """
     if gas_payer is not None:
         return _native_tx(
