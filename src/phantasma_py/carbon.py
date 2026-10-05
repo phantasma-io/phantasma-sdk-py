@@ -2419,7 +2419,9 @@ def build_transfer_fungible_tx(
 
     from_address is the account whose tokens move (always a witness); gas_payer is a different
     account that pays the gas and becomes the first witness (None = the sender pays); amount is in
-    the token's atoms (u64; big-fungible tokens need a script transfer).
+    the token's atoms. A big-fungible token moves this way too. The chain reads the amount as a
+    signed 64-bit value, so it refuses one above the int64 maximum. A larger amount needs a
+    Token.TransferFungible module call or a script transfer, whose amounts are big integers.
     """
     if gas_payer is not None:
         return _native_tx(
