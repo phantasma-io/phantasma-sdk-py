@@ -297,11 +297,17 @@ class ScriptBuilder:
     """
 
     MAX_REGISTER_COUNT = 32
+    # The farthest targets the chain accepts. It reads a target from two bytes: a jump target as a
+    # signed number, a call target as an unsigned one.
+    _MAX_JUMP_TARGET = 0x7FFF
+    _MAX_CALL_TARGET = 0xFFFF
 
     def __init__(self) -> None:
         self._writer = BinaryWriter()
         self._jump_locations: dict[int, str] = {}
         self._label_locations: dict[str, int] = {}
+        # The offsets in _jump_locations that a CALL reserved. Every other offset belongs to a jump.
+        self._call_offsets: set[int] = set()
         self._error: Exception | None = None
 
     @classmethod
@@ -337,6 +343,9 @@ class ScriptBuilder:
             if normalized not in self._label_locations:
                 raise BuilderError(f"could not find label: {label}")
             target = self._label_locations[normalized]
+            limit = self._MAX_CALL_TARGET if offset in self._call_offsets else self._MAX_JUMP_TARGET
+            if target > limit:
+                raise BuilderError(f"label offset {target} is above {limit}, the largest target allowed here")
             if offset < 0 or offset + 1 >= len(script):
                 raise BuilderError(f"invalid jump patch offset: {offset}")
             script[offset : offset + 2] = target.to_bytes(2, "little")
@@ -423,6 +432,7 @@ class ScriptBuilder:
         offset = self.current_size
         self._writer.write_u16_le(0)
         self._jump_locations[offset] = label
+        self._call_offsets.add(offset)
         return self
 
     def emit_conditional_jump(self, opcode: Opcode, src_reg: int, label: str) -> ScriptBuilder:

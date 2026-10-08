@@ -125,6 +125,32 @@ def test_script_builder_reports_errors_without_emitting_invalid_script() -> None
         ScriptBuilder.begin().emit_jump(Opcode.JMP, "missing").end_script()
 
 
+def _jump_over(fill: int) -> ScriptBuilder:
+    # A JMP takes 3 bytes and the label's NOP 1, so after `fill` zero bytes the label sits at fill + 4.
+    return ScriptBuilder.begin().emit_jump(Opcode.JMP, "far").emit_raw(bytes(fill)).emit_label("far")
+
+
+def _call_over(fill: int) -> ScriptBuilder:
+    # A CALL takes 4 bytes and the label's NOP 1, so after `fill` zero bytes the label sits at fill + 5.
+    return ScriptBuilder.begin().emit_call("far", 1).emit_raw(bytes(fill)).emit_label("far")
+
+
+def test_script_builder_jump_reaches_offset_32767_and_no_farther() -> None:
+    # The chain reads a jump target as a signed 16-bit number and refuses 0x8000 or more.
+    _jump_over(32763).end_script()
+    with pytest.raises(BuilderError, match="above 32767"):
+        _jump_over(32764).end_script()
+
+
+def test_script_builder_call_reaches_offset_65535_and_no_farther() -> None:
+    # 32769 is 0x8001: beyond the jump limit, and still a valid call target.
+    assert _call_over(32764).end_script()[2:4] == bytes([0x01, 0x80])
+    _call_over(65530).end_script()
+    # 65536 does not fit two bytes.
+    with pytest.raises(BuilderError, match="above 65535"):
+        _call_over(65531).end_script()
+
+
 def test_script_builder_runtime_helper_parity() -> None:
     keys = PhantasmaKeys.from_wif("KxMn2TgXukYaNXx7tEdjh7qB2YaMgeuKy47j4rvKigHhBuZWeP3r")
     other = Address.null()
