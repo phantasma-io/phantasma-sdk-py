@@ -919,6 +919,17 @@ class TokenSchemasJSON:
 SchemaFieldInput = TokenSchemaField | tuple[str, VMType | str] | Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class MetadataDynamicValue:
+    """The value of a Dynamic metadata field, or of one item of an Array_Dynamic field. Such a field
+    can hold a value of any VM type, and the chain stores the type with the value, so the type is
+    named here. value is given as for a field of that type. The type cannot be Dynamic,
+    Array_Dynamic, Struct or Array_Struct."""
+
+    type: VMType
+    value: Any
+
+
 @dataclass(slots=True)
 class ChainConfig:
     version: int = 0
@@ -3290,11 +3301,13 @@ def _coerce_metadata_value(name: str, schema: VMVariableSchema, value: Any) -> A
         return _coerce_metadata_struct(name, schema.struct_def, value)
     if vm_type == VMType.ARRAY_STRUCT:
         return _coerce_metadata_struct_array(name, schema.struct_def, value)
+    if vm_type == VMType.DYNAMIC:
+        return _coerce_metadata_dynamic(name, value)
     if vm_type == VMType.ARRAY_DYNAMIC:
-        values = _ensure_metadata_sequence(name, value)
-        if not all(isinstance(item, VMDynamicVariable) for item in values):
-            raise BuilderError(f'metadata field "{name}" must contain dynamic VM variables')
-        return list(values)
+        return [
+            _coerce_metadata_dynamic(f"{name}[{index}]", item)
+            for index, item in enumerate(_ensure_metadata_sequence(name, value))
+        ]
     if vm_type == VMType.ARRAY_BYTES:
         return [
             _ensure_metadata_bytes(f"{name}[{index}]", item)
@@ -3332,6 +3345,30 @@ def _coerce_metadata_value(name: str, schema: VMVariableSchema, value: Any) -> A
             for index, item in enumerate(_ensure_metadata_sequence(name, value))
         ]
     return value
+
+
+# A Dynamic value is written with its own type and without a schema. A MetadataDynamicValue names one
+# type, so it cannot give the types of the fields of a Struct or Array_Struct. It takes no Dynamic or
+# Array_Dynamic value either, because no use is known for typed values nested in a typed value. So a
+# Dynamic value holds a scalar or an array of scalars.
+_DYNAMIC_VALUE_REFUSED_TYPES = {VMType.DYNAMIC, VMType.ARRAY_DYNAMIC, VMType.STRUCT, VMType.ARRAY_STRUCT}
+
+
+def _coerce_metadata_dynamic(name: str, value: Any) -> VMDynamicVariable:
+    """Returns the variable a Dynamic field stores. A MetadataDynamicValue becomes a VMDynamicVariable
+    of the type it names, its value checked as for a field of that type. A VMDynamicVariable is stored
+    as it is given."""
+    if isinstance(value, VMDynamicVariable):
+        return value
+    if not isinstance(value, MetadataDynamicValue):
+        raise BuilderError(f'metadata field "{name}" is Dynamic and must be given as a MetadataDynamicValue')
+    try:
+        vm_type = VMType(value.type)
+    except (TypeError, ValueError):
+        raise BuilderError(f'metadata field "{name}" names an unknown type {value.type!r}') from None
+    if vm_type in _DYNAMIC_VALUE_REFUSED_TYPES:
+        raise BuilderError(f'metadata field "{name}" cannot hold a Dynamic value of type {vm_type_name(vm_type)}')
+    return VMDynamicVariable(vm_type, _coerce_metadata_value(name, VMVariableSchema(vm_type), value.value))
 
 
 def _coerce_metadata_struct(name: str, schema: VMStructSchema | None, value: Any) -> VMDynamicStruct:

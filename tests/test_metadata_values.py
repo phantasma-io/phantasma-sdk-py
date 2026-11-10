@@ -1,14 +1,26 @@
 """Metadata values: each value is checked against the type of its field.
 
 An Int64 or Int256 value can be a string of decimal digits, because JSON keeps a big integer exact
-only as text. Such a string is checked against the range of its field as a number is."""
+only as text. Such a string is checked against the range of its field as a number is.
+
+A Dynamic field can hold a value of any VM type, and the chain stores the type with the value. So
+the value names its type: a MetadataDynamicValue, its value given as for a field of that type."""
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
-from phantasma_py import BuilderError, build_phantasma_nft_rom
-from phantasma_py.carbon import VMNamedVariableSchema, VMStructSchema, VMType
+from phantasma_py import BuilderError, MetadataDynamicValue, build_phantasma_nft_rom
+from phantasma_py.carbon import (
+    CarbonReader,
+    VMDynamicStruct,
+    VMDynamicVariable,
+    VMNamedVariableSchema,
+    VMStructSchema,
+    VMType,
+)
 
 INT256_MIN = -(1 << 255)
 UINT256_MAX = (1 << 256) - 1
@@ -107,3 +119,128 @@ def test_an_item_of_an_array_int256_in_hex_is_refused() -> None:
 def test_int8_int16_and_int32_still_refuse_text() -> None:
     for vm_type in (VMType.INT8, VMType.INT16, VMType.INT32):
         assert refusal(vm_type, "5") == 'metadata field "x" must be an integer'
+
+
+def test_a_dynamic_field_stores_its_value_with_the_type_it_names() -> None:
+    root = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"
+    schema = VMStructSchema(
+        [
+            VMNamedVariableSchema.make("extra", VMType.DYNAMIC),
+            VMNamedVariableSchema.make("names", VMType.DYNAMIC),
+            VMNamedVariableSchema.make("extras", VMType.ARRAY_DYNAMIC),
+            VMNamedVariableSchema.make("note", VMType.STRING),
+        ]
+    )
+
+    rom = build_phantasma_nft_rom(
+        schema,
+        [
+            ("extra", MetadataDynamicValue(VMType.INT64, "9007199254740993")),
+            ("names", MetadataDynamicValue(VMType.ARRAY_STRING, ["a", "b"])),
+            ("extras", [MetadataDynamicValue(VMType.INT32, 5), MetadataDynamicValue(VMType.BYTES32, root)]),
+            ("note", "end"),
+        ],
+    )
+
+    # A Dynamic field is written as its value's type byte and then the value. An Array_Dynamic field
+    # is a count and then each item in the same way.
+    assert rom.hex().upper() == (
+        "0C"  # Int64 2^53 + 1
+        + "0100000000002000"
+        + "17"  # Array_String a, b
+        + "02000000"
+        + "6100"
+        + "6200"
+        + "02000000"  # Int32 5, then Bytes32
+        + "0A"
+        + "05000000"
+        + "12"
+        + root
+        + "656E6400"  # end
+    )
+    # Read back by its schema, a Dynamic field holds the stored value with the value's own type.
+    read = VMDynamicStruct.read_with_schema(schema, CarbonReader(rom))
+    extra = read.get("extra")
+    assert extra is not None and extra.type == VMType.DYNAMIC
+    assert extra.data == VMDynamicVariable(VMType.INT64, 9007199254740993)
+
+
+def test_a_dynamic_field_takes_a_vm_dynamic_variable_as_it_is_given() -> None:
+    raw = VMDynamicVariable(VMType.STRING, "raw")
+
+    assert rom_of(("x", VMType.DYNAMIC, raw)) == rom_of(
+        ("x", VMType.DYNAMIC, MetadataDynamicValue(VMType.STRING, "raw"))
+    )
+    # The two forms can stand side by side in an Array_Dynamic field.
+    rom = rom_of(("x", VMType.ARRAY_DYNAMIC, [raw, MetadataDynamicValue(VMType.INT8, 1)]))
+    assert rom.hex().upper() == "02000000" + "16" + "72617700" + "06" + "01"
+
+
+def test_a_typed_value_inside_a_struct_field() -> None:
+    schema = VMStructSchema(
+        [
+            VMNamedVariableSchema.make(
+                "stats", VMType.STRUCT, VMStructSchema([VMNamedVariableSchema.make("extra", VMType.DYNAMIC)])
+            )
+        ]
+    )
+
+    rom = build_phantasma_nft_rom(schema, [("stats", {"extra": MetadataDynamicValue(VMType.INT64, "5")})])
+
+    assert rom.hex().upper() == "0C" + "0500000000000000"
+
+
+@pytest.mark.parametrize(
+    ("vm_type", "value", "message"),
+    [
+        pytest.param(
+            VMType.DYNAMIC,
+            "text",
+            'metadata field "x" is Dynamic and must be given as a MetadataDynamicValue',
+            id="value-without-type",
+        ),
+        pytest.param(
+            VMType.DYNAMIC,
+            MetadataDynamicValue(cast(VMType, 99), 1),
+            'metadata field "x" names an unknown type 99',
+            id="unknown-type",
+        ),
+        pytest.param(
+            VMType.DYNAMIC,
+            MetadataDynamicValue(VMType.INT8, 300),
+            'metadata field "x" must be between -128 and 127 or between 0 and 255',
+            id="value-checked-by-its-type",
+        ),
+        pytest.param(
+            VMType.ARRAY_DYNAMIC,
+            [MetadataDynamicValue(VMType.INT8, 1), 5],
+            'metadata field "x[1]" is Dynamic and must be given as a MetadataDynamicValue',
+            id="item-without-type",
+        ),
+        pytest.param(
+            VMType.ARRAY_DYNAMIC,
+            [MetadataDynamicValue(VMType.BYTES32, "0011")],
+            'metadata field "x[0]" must be exactly 32 bytes',
+            id="item-checked-by-its-type",
+        ),
+    ],
+)
+def test_a_malformed_dynamic_value_is_refused(vm_type: VMType, value: object, message: str) -> None:
+    assert refusal(vm_type, value) == message
+
+
+# A MetadataDynamicValue names one type, so it cannot give the types of the fields of a struct. It
+# takes no typed value inside a typed value either. The SDK names the type of Array_Dynamic, which is
+# the plain Array type, "Array".
+@pytest.mark.parametrize(
+    ("vm_type", "type_name"),
+    [
+        (VMType.STRUCT, "Struct"),
+        (VMType.ARRAY_STRUCT, "Array_Struct"),
+        (VMType.DYNAMIC, "Dynamic"),
+        (VMType.ARRAY_DYNAMIC, "Array"),
+    ],
+)
+def test_a_dynamic_value_of_a_struct_type_or_a_dynamic_type_is_refused(vm_type: VMType, type_name: str) -> None:
+    message = f'metadata field "x" cannot hold a Dynamic value of type {type_name}'
+    assert refusal(VMType.DYNAMIC, MetadataDynamicValue(vm_type, {})) == message

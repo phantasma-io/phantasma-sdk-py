@@ -128,7 +128,8 @@ The builders of NFT data and series metadata (`build_phantasma_nft_rom`,
 | `Bytes16`, `Bytes32`, `Bytes64` | the same, of exactly 16, 32 or 64 bytes, or a `Bytes16`, `Bytes32` or `Bytes64` |
 | `Struct` | a mapping or a list of `(name, value)` pairs with a value for every field of the struct, or a `VMDynamicStruct` that holds every field |
 | `Array_Struct` | a list of such structs, or a `VMStructArray` |
-| `Array_Dynamic` | a list of `VMDynamicVariable` values |
+| `Dynamic` | a `MetadataDynamicValue`: the type and the value |
+| `Array_Dynamic` | a list of such values |
 | other `Array_...` types | a list of values of the item type |
 
 ```python
@@ -149,6 +150,15 @@ rom = build_phantasma_nft_rom(
 ```
 
 `schemas_json` is the JSON above.
+
+The chain stores a value of any type in a `Dynamic` field, together with that
+type. The SDK takes such a value as a `MetadataDynamicValue`, whose `value` is
+given as for a field of its `type`. The `type` cannot be `Dynamic`,
+`Array_Dynamic`, `Struct` or `Array_Struct`. A `Dynamic` field also takes a
+`VMDynamicVariable`, which is stored as it is given. An `Array_Dynamic` field
+takes a list of such values. Read back by its schema, a `Dynamic` field is a
+`VMDynamicVariable` of type `Dynamic` whose `data` is the stored value, a
+`VMDynamicVariable` of that value's own type.
 
 ## Changing Token Metadata
 
