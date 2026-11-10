@@ -52,6 +52,8 @@ Token helper functions create Carbon payloads in the chain's wire order:
 - `build_create_token_tx_and_sign`
 - `build_create_token_series_tx`
 - `build_create_token_series_tx_and_sign`
+- `build_update_token_metadata_tx`
+- `build_update_token_metadata_tx_and_sign`
 - `build_mint_phantasma_non_fungible_tx`
 - `build_mint_phantasma_non_fungible_tx_and_sign`
 
@@ -73,6 +75,66 @@ data URIs, and wrong schema field names raise explicit SDK errors.
 
 Token symbols follow the current Carbon token-module rule: one or more uppercase
 ASCII letters `A-Z`.
+
+## Changing Token Metadata
+
+`build_update_token_metadata_tx` builds `Token.UpdateTokenMetadata`, signed by
+the token owner. The chain merges an update into the stored metadata field by
+field, so a field the update does not name keeps its value. A field is removed
+by sending it as an empty `Array_Dynamic`. This is the only value the chain
+reads as a removal:
+
+```python
+from phantasma_py.carbon import (
+    VMDynamicStruct,
+    VMNamedDynamicVariable,
+    VMType,
+    build_update_token_metadata_tx,
+    bytes32_from_public_key,
+)
+from phantasma_py.crypto import PhantasmaKeys
+
+keys = PhantasmaKeys.from_wif("...")
+update = VMDynamicStruct(
+    [
+        VMNamedDynamicVariable.make("description", VMType.STRING, "A new description"),
+        VMNamedDynamicVariable.make("website", VMType.ARRAY_DYNAMIC, []),
+    ]
+)
+msg = build_update_token_metadata_tx(token_id, update, bytes32_from_public_key(keys.public_key))
+tx_hash = rpc.send_transaction(msg, [keys])
+```
+
+`rpc` is a `PhantasmaRPC` client (see `docs/rpc.md`). The planner prices
+`Token.UpdateTokenMetadata` with the script budget, so its plan is an upper
+bound (`plan.exact` is `False`). The chain charges the transfer fee and the
+storage the update adds.
+
+## Sealing A Token Against Contracts
+
+A sealed token never gets a VM contract, from its owner or from governance. Only
+a token without a contract can be sealed, and the seal cannot be removed.
+
+The seal blocks VM contracts only. A sealed token can be minted, transferred and
+burned, and it can get new NFT series and NFT mints. Its other metadata fields
+can be changed.
+
+The seal is the metadata field `_sealed_c` holding the Int64 value 1
+(`STANDARD_META_TOKEN_SEALED_CONTRACT`).
+
+Seal a token when it is created:
+
+```python
+metadata = build_token_metadata(fields, seal_contract=True)
+```
+
+Seal a token that already exists:
+
+```python
+owner = bytes32_from_public_key(keys.public_key)
+msg = build_update_token_metadata_tx(token_id, build_contract_seal_update(), owner)
+tx_hash = rpc.send_transaction(msg, [keys])
+```
 
 ## Module Call Args
 

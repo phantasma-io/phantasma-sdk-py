@@ -62,6 +62,8 @@ from phantasma_py.carbon import (
     TxMsgTransferNonFungibleSingle,
     TxMsgTransferNonFungibleSingleGasPayer,
     TxType,
+    UpdateTokenMetadataArgs,
+    build_contract_seal_update,
     build_token_info,
     build_token_metadata,
     required_witnesses,
@@ -268,13 +270,25 @@ def token_method_cases() -> list[tuple[int, bytes, NativeFeeKind]]:
             NativeFeeKind.MINT_PHANTASMA_NON_FUNGIBLE,
         ),
     ]
+    # The planner has no formula for UPDATE_TOKEN_METADATA. It prices the call with the script budget,
+    # so its plan is an upper bound. The row carries the arguments that build_update_token_metadata_tx
+    # writes.
+    budgeted: list[tuple[int, bytes, NativeFeeKind]] = [
+        (
+            TokenContractMethod.UPDATE_TOKEN_METADATA,
+            serialize(UpdateTokenMetadataArgs(9, build_contract_seal_update())),
+            NativeFeeKind.SCRIPT,
+        ),
+    ]
     # Every other method of the module is budgeted. MINT_NON_FUNGIBLE is among them on purpose: the
     # chain refuses an explicit NFT mint where governance has not allowed caller-supplied ROM ids,
     # whichever way it arrives, so there is nothing to price.
-    priced = {method for method, _, _ in modelled}
-    return modelled + [
-        (int(method), PROBE_ARGS, NativeFeeKind.SCRIPT) for method in TokenContractMethod if method not in priced
-    ]
+    decided = {method for method, _, _ in modelled + budgeted}
+    return (
+        modelled
+        + budgeted
+        + [(int(method), PROBE_ARGS, NativeFeeKind.SCRIPT) for method in TokenContractMethod if method not in decided]
+    )
 
 
 def test_plans_every_token_contract_method_as_declared() -> None:

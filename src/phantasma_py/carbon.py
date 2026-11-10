@@ -79,7 +79,8 @@ STANDARD_META_ID = "_i"
 
 # Standard metadata keys the chain recognises in token, series and chain metadata. The fee planner
 # reads the token keys that change a creation's bill (_brn, _ip, _soi, _srt) out of the CreateToken
-# call; the builders write _i into series metadata and NFT ROMs.
+# call; the builders write _i into series metadata and NFT ROMs. A token whose metadata holds
+# _sealed_c as the Int64 1 never gets a VM contract.
 STANDARD_META_CHAIN_ADDRESS = "_a"
 STANDARD_META_CHAIN_NAME = "_n"
 STANDARD_META_CHAIN_NEXUS = "_x"
@@ -99,6 +100,7 @@ STANDARD_META_TOKEN_PHANTASMA_SCRIPT = "_phs"
 STANDARD_META_TOKEN_PHANTASMA_ABI = "_phb"
 STANDARD_META_TOKEN_PRE_BURN = "_brn"
 STANDARD_META_TOKEN_INFLATION_PERIOD = "_ip"
+STANDARD_META_TOKEN_SEALED_CONTRACT = "_sealed_c"
 _MISSING = object()
 
 
@@ -2603,18 +2605,46 @@ def verify_token_schemas(schemas: TokenSchemas) -> None:
     _assert_metadata_fields([schemas.rom], _standard_nft_fields())
 
 
-def build_token_metadata(fields: dict[str, str]) -> bytes:
+def build_token_metadata(fields: dict[str, str], *, seal_contract: bool = False) -> bytes:
+    """Returns the serialized metadata of a new token. fields are strings and must hold name, icon,
+    url and description; icon is a base64 data URI of a PNG, JPEG or WebP image.
+
+    seal_contract seals the token against VM contracts: the metadata gets _sealed_c as the Int64 1.
+    A sealed token never gets a VM contract, from its owner or from governance. Only a token without
+    a contract can be sealed, and the seal cannot be removed. The seal blocks VM contracts only. A
+    sealed token can be minted, transferred and burned, and it can get new NFT series and NFT mints.
+    Its other metadata fields can be changed.
+    """
     required = ("name", "icon", "url", "description")
     if len(fields) < len(required):
         raise BuilderError("token metadata is mandatory")
+    # The chain takes the seal only as the Int64 1, and these fields are strings. So the seal key is
+    # refused here with a message that names the option.
+    if STANDARD_META_TOKEN_SEALED_CONTRACT in fields:
+        raise BuilderError(
+            "pass seal_contract=True to seal a token against contracts: "
+            "_sealed_c holds the Int64 1, which a string field cannot carry"
+        )
     for field_name in required:
         if not fields.get(field_name, "").strip():
             raise BuilderError(f"token metadata is missing required field: {field_name}")
     _validate_icon_data_uri(fields["icon"])
-    structure = VMDynamicStruct(
-        [VMNamedDynamicVariable.make(name, VMType.STRING, value) for name, value in fields.items()]
-    )
-    return serialize(structure)
+    metadata = [VMNamedDynamicVariable.make(name, VMType.STRING, value) for name, value in fields.items()]
+    if seal_contract:
+        metadata.append(_contract_seal_field())
+    return serialize(VMDynamicStruct(metadata))
+
+
+def build_contract_seal_update() -> VMDynamicStruct:
+    """Returns the metadata update that seals an existing token against VM contracts, for
+    build_update_token_metadata_tx. The chain merges an update into the stored metadata, so every
+    other field keeps its value. The rules of the seal are those of the seal_contract option of
+    build_token_metadata; a token that has a VM contract cannot be sealed."""
+    return VMDynamicStruct([_contract_seal_field()])
+
+
+def _contract_seal_field() -> VMNamedDynamicVariable:
+    return VMNamedDynamicVariable.make(STANDARD_META_TOKEN_SEALED_CONTRACT, VMType.INT64, 1)
 
 
 def build_token_info(
@@ -2764,6 +2794,65 @@ def build_create_token_series_tx_and_sign_hex(
     options: PlanAndSignOptions | None = None,
 ) -> str:
     return build_create_token_series_tx_and_sign(token_id, series_info, signer, config, options).hex()
+
+
+def build_update_token_metadata_tx(
+    token_id: int, metadata: VMDynamicStruct, owner: Bytes32, limits: TxLimits | None = None
+) -> TxMsg:
+    """Builds a Token.UpdateTokenMetadata call, which the token owner or governance sends to change a
+    token's metadata. The message carries the limits given and nothing else: plan its fees from the
+    message before signing, or pass the offer in limits.
+
+    The chain merges the update into the stored metadata field by field, so a field the update leaves
+    out keeps its value. build_contract_seal_update returns the update that seals a token against VM
+    contracts.
+
+    A field is removed by sending it as an empty Array_Dynamic, the only value the chain reads as a
+    removal. A Dynamic value without data is stored like any other value.
+
+    The planner has no formula for this call and prices it with the script budget, so the plan is an
+    upper bound (FeePlan.exact is False). The chain charges the transfer fee and the storage the
+    token's row grows by.
+    """
+    if not 0 < token_id < (1 << 64):
+        raise BuilderError("token_id must be between 1 and 2^64 - 1: the chain assigns no token id 0")
+    if not metadata.fields:
+        raise BuilderError("a metadata update needs at least one field")
+    # The chain takes the seal only as the Int64 1, and a seal cannot be removed.
+    seal = metadata.get(STANDARD_META_TOKEN_SEALED_CONTRACT)
+    if seal is not None and not (seal.type == VMType.INT64 and seal.data == 1):
+        raise BuilderError("_sealed_c must be the Int64 1: build it with build_contract_seal_update")
+    args = serialize(UpdateTokenMetadataArgs(token_id, metadata))
+    return _call_tx(owner, limits, TxMsgCall(ModuleID.TOKEN, TokenContractMethod.UPDATE_TOKEN_METADATA, args))
+
+
+def build_update_token_metadata_tx_and_sign(
+    token_id: int,
+    metadata: VMDynamicStruct,
+    signer: PhantasmaKeys,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
+) -> bytes:
+    """Builds a Token.UpdateTokenMetadata call, plans it against config and signs it with the owner's
+    keys. A call whose offer options.limits already fixes is signed as it is. See
+    plan_and_sign_with_keys."""
+    from .fees import PlanAndSignOptions, plan_and_sign_with_keys
+
+    options = options or PlanAndSignOptions()
+    owner = bytes32_from_public_key(signer.public_key)
+    return plan_and_sign_with_keys(
+        build_update_token_metadata_tx(token_id, metadata, owner, options.limits), [signer], config, options
+    )
+
+
+def build_update_token_metadata_tx_and_sign_hex(
+    token_id: int,
+    metadata: VMDynamicStruct,
+    signer: PhantasmaKeys,
+    config: GasConfig | None = None,
+    options: PlanAndSignOptions | None = None,
+) -> str:
+    return build_update_token_metadata_tx_and_sign(token_id, metadata, signer, config, options).hex()
 
 
 def build_mint_phantasma_non_fungible_tx(
