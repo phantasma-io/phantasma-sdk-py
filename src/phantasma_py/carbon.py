@@ -897,10 +897,14 @@ class TokenSchemas:
 
 @dataclass(frozen=True, slots=True)
 class TokenSchemaField:
-    """Public JSON field declaration used by token schema builders."""
+    """A field of a token schema as parse_token_schemas_json reads it: its name, its VM type and, for a
+    Struct or Array_Struct field, the fields of its struct."""
 
     name: str
     type: VMType
+    # The fields of a Struct field, or of each struct of an Array_Struct field. Empty for the other
+    # types. A tuple, so that the field stays hashable.
+    fields: tuple[TokenSchemaField, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2556,6 +2560,9 @@ def build_and_serialize_token_schemas(schemas: TokenSchemas | None = None) -> by
 
 
 def parse_token_schemas_json(data: str) -> TokenSchemasJSON:
+    """Reads token schemas from JSON: three arrays of fields, seriesMetadata, rom and ram. A field is
+    {"name", "type"}, and a Struct or Array_Struct field also has "fields", the fields of its struct in
+    the same form."""
     raw = json.loads(data)
     if not isinstance(raw, Mapping):
         raise BuilderError("token schemas JSON must be an object")
@@ -3085,25 +3092,46 @@ def _parse_token_schema_field_array(raw: Mapping[str, object], key: str) -> list
     items = raw.get(key)
     if not isinstance(items, list):
         raise BuilderError(f"{key} must be an array")
-    out: list[TokenSchemaField] = []
-    for index, item in enumerate(items):
-        if not isinstance(item, Mapping):
-            raise BuilderError(f"{key} field {index} invalid")
-        name = item.get("name")
-        raw_type = item.get("type")
-        if not isinstance(name, str):
-            raise BuilderError(f"{key} field name must be string")
-        if not isinstance(raw_type, str):
-            raise BuilderError(f"{key} field type must be string")
-        out.append(TokenSchemaField(name, vm_type_from_string(raw_type)))
-    return out
+    return [_parse_token_schema_field(item, key) for item in items]
+
+
+def _parse_token_schema_field(item: object, path: str) -> TokenSchemaField:
+    """Reads one field of a token schema. path names the list the field stands in, for the error
+    messages: the list's key, then .name for each struct field around it, as in rom.stats."""
+    if not isinstance(item, Mapping):
+        raise BuilderError(f"{path} field must be an object")
+    name = item.get("name")
+    raw_type = item.get("type")
+    if not isinstance(name, str):
+        raise BuilderError(f"{path} field name must be string")
+    if not isinstance(raw_type, str):
+        raise BuilderError(f"{path} field type must be string")
+    vm_type = vm_type_from_string(raw_type)
+    field_path = f"{path}.{name}"
+    type_name = vm_type_name(vm_type)
+    # The chain keeps the schema of a struct inside the schema of a Struct or Array_Struct field, and
+    # writes the field's values by it. So such a field cannot be built without its fields.
+    if vm_type not in {VMType.STRUCT, VMType.ARRAY_STRUCT}:
+        if "fields" in item:
+            raise BuilderError(f"{field_path} has the type {type_name} and cannot have fields")
+        return TokenSchemaField(name, vm_type)
+    children = item.get("fields")
+    if not isinstance(children, list):
+        raise BuilderError(f"{field_path} has the type {type_name} and needs a fields array")
+    if not children:
+        raise BuilderError(f"{field_path} has the type {type_name} and needs at least one field")
+    return TokenSchemaField(name, vm_type, tuple(_parse_token_schema_field(child, field_path) for child in children))
 
 
 def _token_schema_fields_to_schemas(fields: Sequence[SchemaFieldInput]) -> list[VMNamedVariableSchema]:
-    return [
-        VMNamedVariableSchema.make(field.name, field.type)
-        for field in (_coerce_token_schema_field(item) for item in fields)
-    ]
+    out: list[VMNamedVariableSchema] = []
+    for item in fields:
+        declared = _coerce_token_schema_field(item)
+        # A Struct or Array_Struct field carries the schema of its struct, with no flags, and the chain
+        # writes the field's values by it.
+        struct_def = VMStructSchema(_token_schema_fields_to_schemas(declared.fields)) if declared.fields else None
+        out.append(VMNamedVariableSchema.make(declared.name, declared.type, struct_def))
+    return out
 
 
 def _coerce_token_schema_field(value: SchemaFieldInput) -> TokenSchemaField:
@@ -3125,10 +3153,16 @@ def _coerce_token_schema_field(value: SchemaFieldInput) -> TokenSchemaField:
         if not isinstance(name, str):
             raise BuilderError("field name must be string")
         if isinstance(raw_type, VMType):
-            return TokenSchemaField(name, raw_type)
-        if isinstance(raw_type, str):
-            return TokenSchemaField(name, vm_type_from_string(raw_type))
-        raise BuilderError("field type must be string")
+            vm_type = raw_type
+        elif isinstance(raw_type, str):
+            vm_type = vm_type_from_string(raw_type)
+        else:
+            raise BuilderError("field type must be string")
+        # A mapping has the shape of the JSON field, so the fields of a struct come under "fields".
+        children = value.get("fields", ())
+        if not isinstance(children, Sequence) or isinstance(children, str | bytes | bytearray):
+            raise BuilderError(f"{name} fields must be a list")
+        return TokenSchemaField(name, vm_type, tuple(_coerce_token_schema_field(child) for child in children))
     raise BuilderError("field declaration must be a TokenSchemaField, tuple, or mapping")
 
 
