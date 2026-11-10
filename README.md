@@ -155,8 +155,8 @@ payload = serialize(token)
 Carbon token and NFT helpers validate required metadata, token symbol casing,
 standard schema fields, Carbon NFT address packing, and result parsing. Token
 symbols follow the Carbon token-module rule of uppercase ASCII letters `A-Z`.
-`docs/carbon.md` describes how to change token metadata and how to seal a token
-against contracts.
+`docs/carbon.md` describes how to change token metadata, how to seal a token
+against contracts, and which metadata keys the chain reserves.
 
 ## Fee planning: build, plan, sign, send
 

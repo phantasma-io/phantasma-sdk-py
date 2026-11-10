@@ -1,9 +1,12 @@
-"""Token metadata: the contract seal and the Token.UpdateTokenMetadata builder.
+"""Token metadata: the contract seal, the keys the chain reserves, and the Token.UpdateTokenMetadata
+builder.
 
-The seal is the field _sealed_c holding the Int64 1. The chain refuses a VM contract for a sealed
-token, a removal of the seal, and _sealed_c of any other type or value. An update removes a field
-with an empty Array_Dynamic, the only value the chain reads as a removal. These tests hold the SDK's
-builders to the same rules."""
+The chain keeps the metadata keys that start with _ for its own settings: staking, inflation and the
+contract seal. It refuses any other such key in the metadata a token is left with. It refuses _brn in
+an update, because only genesis sets it. The seal is the field _sealed_c holding the Int64 1. The
+chain refuses a VM contract for a sealed token, a removal of the seal, and _sealed_c of any other
+type or value. An update may name another _ key only to remove it, with an empty Array_Dynamic, the
+only value the chain reads as a removal. These tests hold the SDK's builders to the same rules."""
 
 from __future__ import annotations
 
@@ -70,6 +73,11 @@ def update(*fields: VMNamedDynamicVariable) -> VMDynamicStruct:
     return VMDynamicStruct(list(fields))
 
 
+def removal(key: str) -> VMNamedDynamicVariable:
+    """Returns the field as an empty Array_Dynamic, the only value the chain reads as a removal."""
+    return VMNamedDynamicVariable.make(key, VMType.ARRAY_DYNAMIC, [])
+
+
 def call_args(msg: TxMsg) -> bytes:
     assert isinstance(msg.msg, TxMsgCall)
     return msg.msg.args
@@ -110,6 +118,26 @@ def test_refuses__sealed_c_among_the_string_fields() -> None:
         "pass seal_contract=True to seal a token against contracts: "
         "_sealed_c holds the Int64 1, which a string field cannot carry"
     )
+
+
+# _sl is a chain key, and the chain takes it only as an Int64. These fields are strings.
+@pytest.mark.parametrize("key", ["_note", "_sl", "_brn", "_phs"])
+def test_refuses_a_string_field_whose_key_starts_with_an_underscore(key: str) -> None:
+    fields = creation_fields()
+    fields[key] = "x"
+    with pytest.raises(BuilderError) as refused:
+        build_token_metadata(fields)
+    assert str(refused.value) == f"{key} is reserved for the chain: string metadata fields cannot start with _"
+
+
+def test_takes_a_key_whose_underscore_is_not_its_first_character() -> None:
+    fields = creation_fields()
+    fields["my_note"] = "a"
+    fields["note_"] = "b"
+    metadata = deserialize(build_token_metadata(fields), VMDynamicStruct)
+    assert isinstance(metadata, VMDynamicStruct)
+    assert metadata.get("my_note") == VMDynamicVariable(VMType.STRING, "a")
+    assert metadata.get("note_") == VMDynamicVariable(VMType.STRING, "b")
 
 
 def test_builds_a_seal_update_that_holds_the_seal_alone() -> None:
@@ -174,6 +202,84 @@ def test_refuses_an_update_without_fields() -> None:
 def test_refuses_a_seal_other_than_the_int64_1(vm_type: VMType, data: object) -> None:
     seal = VMNamedDynamicVariable.make("_sealed_c", vm_type, data)
     assert refusal(42, update(seal)) == "_sealed_c must be the Int64 1: build it with build_contract_seal_update"
+
+
+def test_refuses__brn_as_a_value_and_as_a_removal() -> None:
+    # Only genesis sets _brn, so the chain refuses an update that names it in any form.
+    for field in (VMNamedDynamicVariable.make("_brn", VMType.INT256, 70), removal("_brn")):
+        assert refusal(42, update(field)) == "_brn is set at genesis only"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        VMNamedDynamicVariable.make("_note", VMType.STRING, "x"),
+        # The chain reads _phs in block 0 only, so an update may not set it.
+        VMNamedDynamicVariable.make("_phs", VMType.BYTES, b"\x01"),
+        # A key that resembles the contract seal is not the seal.
+        VMNamedDynamicVariable.make("_sealed", VMType.INT64, 1),
+        # The chain stores a Dynamic value without data as a value. Only an empty Array_Dynamic
+        # removes a field.
+        VMNamedDynamicVariable.make("_note", VMType.DYNAMIC, None),
+    ],
+    ids=["string", "_phs", "_sealed", "dynamic_without_data"],
+)
+def test_refuses_a_value_for_an_underscore_key_the_chain_does_not_define(field: VMNamedDynamicVariable) -> None:
+    assert refusal(42, update(field)) == f"{field.name.value} is reserved for the chain: an update can only remove it"
+
+
+def test_reports_the_first_broken_rule_in_a_fixed_order() -> None:
+    # Each call breaks two rules. The message names the rule that comes first in this order: the token
+    # id, the field count, the seal, _brn, the other _ keys. The two updates list the field of the
+    # later rule first, so a check in the order of the fields would name the later rule.
+    sealed_as_text = VMNamedDynamicVariable.make("_sealed_c", VMType.STRING, "1")
+    assert refusal(42, update(removal("_brn"), sealed_as_text)).startswith("_sealed_c must be the Int64 1")
+    unknown_key = VMNamedDynamicVariable.make("_a", VMType.STRING, "x")
+    assert refusal(42, update(unknown_key, removal("_brn"))).startswith("_brn is set at genesis only")
+    assert refusal(0, VMDynamicStruct()).startswith("token_id must be between 1 and 2^64 - 1")
+
+
+def test_removes_a_reserved_key_with_an_empty_array_dynamic() -> None:
+    args = call_args(build_update_token_metadata_tx(42, update(removal("_note")), OWNER))
+    # The token id as a u64, a u32 field count, the length-prefixed name, then the type byte of
+    # Array_Dynamic (0x01) and its u32 item count 0. The chain reads exactly this value as a removal.
+    # The C# and TypeScript SDKs write the same bytes for this update.
+    assert args.hex().upper() == "2A00000000000000" + "01000000" + "05" + b"_note".hex().upper() + "01" + "00000000"
+    # The writer writes an Array_Dynamic whose data is None as the same empty array.
+    without_data = VMNamedDynamicVariable.make("_note", VMType.ARRAY_DYNAMIC, None)
+    assert call_args(build_update_token_metadata_tx(42, update(without_data), OWNER)) == args
+
+
+# The keys an update may set, as the chain names them. The SDK checks only which keys are reserved,
+# so an Int64 stands for every value here; the chain checks the type of each setting itself. The
+# Int64 1 is also the one value _sealed_c takes.
+@pytest.mark.parametrize(
+    "key",
+    [
+        "_soi",
+        "_sot",
+        "_srt",
+        "_srp",
+        "_srm",
+        "_srd",
+        "_sl",
+        "_sbt",
+        "_sbm",
+        "_sbd",
+        "_sbl",
+        "_ip",
+        "_ia",
+        "_iib",
+        "_iie",
+        "_ifr",
+        "_sealed_c",
+    ],
+)
+def test_lets_an_update_set_the_chain_key(key: str) -> None:
+    field = VMNamedDynamicVariable.make(key, VMType.INT64, 1)
+    args = deserialize(call_args(build_update_token_metadata_tx(42, update(field), OWNER)), UpdateTokenMetadataArgs)
+    assert isinstance(args, UpdateTokenMetadataArgs)
+    assert args.metadata.fields == [field]
 
 
 def test_update_and_sign_plans_the_call_with_the_script_budget_before_signing() -> None:

@@ -4,6 +4,7 @@ bound, and prices with the calculator the estimator tests pin to live bills."""
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 
 import pytest
 
@@ -37,13 +38,15 @@ from phantasma_py.carbon import (
     TxMsgTransferNonFungibleMulti,
     TxPayload,
     TxType,
+    VMDynamicStruct,
+    VMNamedDynamicVariable,
+    VMType,
     build_and_serialize_token_schemas,
     build_create_token_series_tx,
     build_create_token_tx,
     build_mint_phantasma_non_fungible_tx,
     build_series_info,
     build_token_info,
-    build_token_metadata,
     bytes32_from_public_key,
     deserialize,
     envelope_bytes,
@@ -108,16 +111,23 @@ def transfer(to: Bytes32, token_id: int) -> TxMsg:
     return base_tx(TxType.TRANSFER_FUNGIBLE, CREATOR, TxMsgTransferFungible(to, token_id, 100_000_000))
 
 
-def create_token(symbol: str, is_nft: bool, extra: dict[str, str] | None = None) -> TxMsg:
-    fields = {"name": "Planned", "icon": ICON, "url": "https://example.com", "description": "a planned token"}
-    fields.update(extra or {})
+def create_token(symbol: str, is_nft: bool, chain_keys: Sequence[VMNamedDynamicVariable] = ()) -> TxMsg:
+    # The chain's own metadata keys are typed values, and build_token_metadata takes string fields
+    # only. So the metadata struct is written here directly.
+    fields = [
+        VMNamedDynamicVariable.make("name", VMType.STRING, "Planned"),
+        VMNamedDynamicVariable.make("icon", VMType.STRING, ICON),
+        VMNamedDynamicVariable.make("url", VMType.STRING, "https://example.com"),
+        VMNamedDynamicVariable.make("description", VMType.STRING, "a planned token"),
+        *chain_keys,
+    ]
     info = build_token_info(
         symbol,
         IntX(0),
         is_nft=is_nft,
         decimals=8,
         owner=CREATOR,
-        metadata=build_token_metadata(fields),
+        metadata=serialize(VMDynamicStruct(fields)),
         token_schemas=build_and_serialize_token_schemas() if is_nft else b"",
     )
     return build_create_token_tx(info, CREATOR, TxLimits(expiry=EXPIRY))
@@ -206,17 +216,21 @@ def test_reads_a_token_creation_out_of_its_call() -> None:
     nft = plan_fees(create_token("PLANNED", True), config(), ONE_WITNESS)
     assert nft.new_storage_quanta == 4, "an NFT token adds its series counter row"
 
+    def planned_with(key: str, value: int) -> FeePlan:
+        chain_key = VMNamedDynamicVariable.make(key, VMType.INT64, value)
+        return plan_fees(create_token("PLANNED", False, [chain_key]), config(), ONE_WITNESS)
+
     # The staking keys cost a lookup each; the pre-burn and inflation keys write a row each. The
     # metadata grows by the key it carries, which the token-info row and the envelope both carry;
     # take that growth out to see the lookup alone.
     plain = plan_fees(create_token("PLANNED", False), config(), ONE_WITNESS)
-    org = plan_fees(create_token("PLANNED", False, {"_soi": "1"}), config(), ONE_WITNESS)
-    reward = plan_fees(create_token("PLANNED", False, {"_srt": "1"}), config(), ONE_WITNESS)
+    org = planned_with("_soi", 3)
+    reward = planned_with("_srt", 97)
     assert (org.expected_gas_bill - block_data(org)) - (plain.expected_gas_bill - block_data(plain)) == 100_000
     assert (reward.expected_gas_bill - block_data(reward)) - (plain.expected_gas_bill - block_data(plain)) == 100_000
-    pre_burn = plan_fees(create_token("PLANNED", False, {"_brn": "1"}), config(), ONE_WITNESS)
+    pre_burn = planned_with("_brn", 5)
     assert pre_burn.new_storage_quanta == plain.new_storage_quanta + 1
-    inflation = plan_fees(create_token("PLANNED", False, {"_ip": "1"}), config(), ONE_WITNESS)
+    inflation = planned_with("_ip", 86_400_000)
     assert inflation.new_storage_quanta == plain.new_storage_quanta + 1
 
 

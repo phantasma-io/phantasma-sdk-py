@@ -80,7 +80,8 @@ STANDARD_META_ID = "_i"
 # Standard metadata keys the chain recognises in token, series and chain metadata. The fee planner
 # reads the token keys that change a creation's bill (_brn, _ip, _soi, _srt) out of the CreateToken
 # call; the builders write _i into series metadata and NFT ROMs. A token whose metadata holds
-# _sealed_c as the Int64 1 never gets a VM contract.
+# _sealed_c as the Int64 1 never gets a VM contract. The chain applies _ifr, the inflation reset, and
+# does not store it.
 STANDARD_META_CHAIN_ADDRESS = "_a"
 STANDARD_META_CHAIN_NAME = "_n"
 STANDARD_META_CHAIN_NEXUS = "_x"
@@ -100,6 +101,10 @@ STANDARD_META_TOKEN_PHANTASMA_SCRIPT = "_phs"
 STANDARD_META_TOKEN_PHANTASMA_ABI = "_phb"
 STANDARD_META_TOKEN_PRE_BURN = "_brn"
 STANDARD_META_TOKEN_INFLATION_PERIOD = "_ip"
+STANDARD_META_TOKEN_INFLATION_AMOUNTS = "_ia"
+STANDARD_META_TOKEN_INFLATION_INITIAL_BEGIN = "_iib"
+STANDARD_META_TOKEN_INFLATION_INITIAL_END = "_iie"
+STANDARD_META_TOKEN_INFLATION_FORCE_RESET = "_ifr"
 STANDARD_META_TOKEN_SEALED_CONTRACT = "_sealed_c"
 _MISSING = object()
 
@@ -2607,7 +2612,8 @@ def verify_token_schemas(schemas: TokenSchemas) -> None:
 
 def build_token_metadata(fields: dict[str, str], *, seal_contract: bool = False) -> bytes:
     """Returns the serialized metadata of a new token. fields are strings and must hold name, icon,
-    url and description; icon is a base64 data URI of a PNG, JPEG or WebP image.
+    url and description; icon is a base64 data URI of a PNG, JPEG or WebP image. No key may start
+    with _, because the chain keeps such keys for its own settings.
 
     seal_contract seals the token against VM contracts: the metadata gets _sealed_c as the Int64 1.
     A sealed token never gets a VM contract, from its owner or from governance. Only a token without
@@ -2625,6 +2631,11 @@ def build_token_metadata(fields: dict[str, str], *, seal_contract: bool = False)
             "pass seal_contract=True to seal a token against contracts: "
             "_sealed_c holds the Int64 1, which a string field cannot carry"
         )
+    # The chain keeps the keys that start with _ for its own settings and refuses any other such key.
+    # Its settings are typed values, so a string field that starts with _ is never a valid setting.
+    reserved = next((name for name in fields if name.startswith("_")), None)
+    if reserved is not None:
+        raise BuilderError(f"{reserved} is reserved for the chain: string metadata fields cannot start with _")
     for field_name in required:
         if not fields.get(field_name, "").strip():
             raise BuilderError(f"token metadata is missing required field: {field_name}")
@@ -2796,6 +2807,31 @@ def build_create_token_series_tx_and_sign_hex(
     return build_create_token_series_tx_and_sign(token_id, series_info, signer, config, options).hex()
 
 
+# The _ keys an update may set: the chain's own settings, and _ifr, the inflation reset that the chain
+# applies and does not store. _brn is not among them, because only genesis sets it.
+_UPDATABLE_CHAIN_KEYS = frozenset(
+    {
+        STANDARD_META_TOKEN_STAKING_ORG_ID,
+        STANDARD_META_TOKEN_STAKING_ORG_THRESHOLD,
+        STANDARD_META_TOKEN_STAKING_REWARD_TOKEN,
+        STANDARD_META_TOKEN_STAKING_REWARD_PERIOD,
+        STANDARD_META_TOKEN_STAKING_REWARD_MUL,
+        STANDARD_META_TOKEN_STAKING_REWARD_DIV,
+        STANDARD_META_TOKEN_STAKING_LOCK,
+        STANDARD_META_TOKEN_STAKING_BOOSTER_TOKEN,
+        STANDARD_META_TOKEN_STAKING_BOOSTER_MUL,
+        STANDARD_META_TOKEN_STAKING_BOOSTER_DIV,
+        STANDARD_META_TOKEN_STAKING_BOOSTER_LIMIT,
+        STANDARD_META_TOKEN_INFLATION_PERIOD,
+        STANDARD_META_TOKEN_INFLATION_AMOUNTS,
+        STANDARD_META_TOKEN_INFLATION_INITIAL_BEGIN,
+        STANDARD_META_TOKEN_INFLATION_INITIAL_END,
+        STANDARD_META_TOKEN_INFLATION_FORCE_RESET,
+        STANDARD_META_TOKEN_SEALED_CONTRACT,
+    }
+)
+
+
 def build_update_token_metadata_tx(
     token_id: int, metadata: VMDynamicStruct, owner: Bytes32, limits: TxLimits | None = None
 ) -> TxMsg:
@@ -2808,7 +2844,9 @@ def build_update_token_metadata_tx(
     contracts.
 
     A field is removed by sending it as an empty Array_Dynamic, the only value the chain reads as a
-    removal. A Dynamic value without data is stored like any other value.
+    removal. A Dynamic value without data is stored like any other value. The keys that start with _
+    belong to the chain. An update may set the chain's own settings, and it may name any other such
+    key only to remove it. An update may not name _brn at all.
 
     The planner has no formula for this call and prices it with the script budget, so the plan is an
     upper bound (FeePlan.exact is False). The chain charges the transfer fee and the storage the
@@ -2822,6 +2860,15 @@ def build_update_token_metadata_tx(
     seal = metadata.get(STANDARD_META_TOKEN_SEALED_CONTRACT)
     if seal is not None and not (seal.type == VMType.INT64 and seal.data == 1):
         raise BuilderError("_sealed_c must be the Int64 1: build it with build_contract_seal_update")
+    # Only genesis sets _brn, so the chain refuses an update that names it, a removal included.
+    if metadata.get(STANDARD_META_TOKEN_PRE_BURN) is not None:
+        raise BuilderError("_brn is set at genesis only")
+    # The chain refuses metadata that keeps a _ key it does not define. A token may hold such a key
+    # from before the chain reserved these keys. Only an update that removes the key can then succeed.
+    for item in metadata.fields:
+        key = item.name.value
+        if key.startswith("_") and key not in _UPDATABLE_CHAIN_KEYS and not _removes_metadata_field(item.value):
+            raise BuilderError(f"{key} is reserved for the chain: an update can only remove it")
     args = serialize(UpdateTokenMetadataArgs(token_id, metadata))
     return _call_tx(owner, limits, TxMsgCall(ModuleID.TOKEN, TokenContractMethod.UPDATE_TOKEN_METADATA, args))
 
@@ -2853,6 +2900,13 @@ def build_update_token_metadata_tx_and_sign_hex(
     options: PlanAndSignOptions | None = None,
 ) -> str:
     return build_update_token_metadata_tx_and_sign(token_id, metadata, signer, config, options).hex()
+
+
+def _removes_metadata_field(value: VMDynamicVariable) -> bool:
+    """Returns True if the value removes its field from token metadata. The chain reads only an empty
+    Array_Dynamic as a removal. The writer writes an Array_Dynamic whose data is None or empty as an
+    array of no items."""
+    return value.type == VMType.ARRAY_DYNAMIC and not value.data
 
 
 def build_mint_phantasma_non_fungible_tx(
