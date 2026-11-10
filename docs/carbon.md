@@ -123,7 +123,7 @@ The builders of NFT data and series metadata (`build_phantasma_nft_rom`,
 |---|---|
 | `String` | a `str` that is not blank |
 | `Int8`, `Int16`, `Int32` | an `int` in the signed or the unsigned range of the type |
-| `Int64`, `Int256` | the same |
+| `Int64`, `Int256` | the same, or a string of decimal digits such as `"-12"` or `"9007199254740993"` |
 | `Bytes` | `bytes`, a `bytearray` or a hex string |
 | `Bytes16`, `Bytes32`, `Bytes64` | the same, of exactly 16, 32 or 64 bytes, or a `Bytes16`, `Bytes32` or `Bytes64` |
 | `Struct` | a mapping or a list of `(name, value)` pairs with a value for every field of the struct, or a `VMDynamicStruct` that holds every field |

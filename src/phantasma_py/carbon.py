@@ -3427,7 +3427,9 @@ def _coerce_integer_for_vm_type(name: str, vm_type: VMType, value: Any) -> int:
         VMType.INT32: 32,
         VMType.INT64: 64,
     }[vm_type]
-    integer = _ensure_metadata_integer(name, value)
+    integer = (
+        _ensure_metadata_wide_integer(name, value) if vm_type == VMType.INT64 else _ensure_metadata_integer(name, value)
+    )
     signed_min = -(1 << (bit_width - 1))
     signed_max = (1 << (bit_width - 1)) - 1
     unsigned_max = (1 << bit_width) - 1
@@ -3441,7 +3443,7 @@ def _coerce_integer_for_vm_type(name: str, vm_type: VMType, value: Any) -> int:
 
 
 def _coerce_int256(name: str, value: Any) -> int:
-    integer = _ensure_metadata_integer(name, value)
+    integer = _ensure_metadata_wide_integer(name, value)
     signed_min = -(1 << 255)
     signed_max = (1 << 255) - 1
     unsigned_max = (1 << 256) - 1
@@ -3455,6 +3457,25 @@ def _coerce_int256(name: str, value: Any) -> int:
 def _ensure_metadata_integer(name: str, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise BuilderError(f'metadata field "{name}" must be an integer')
+    return value
+
+
+def _ensure_metadata_wide_integer(name: str, value: Any) -> int:
+    """Returns an Int64 or Int256 metadata value: an int, or a string of decimal digits with an
+    optional minus sign. The string form takes values that arrive as text: a JSON number above
+    2^53 - 1 loses digits in JavaScript, so such numbers are often written as strings. The caller
+    checks the range."""
+    # [0-9] and fullmatch refuse the other forms int() reads: a plus sign, spaces, underscores and
+    # the digits of other scripts.
+    if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value):
+        digits = value.removeprefix("-").lstrip("0") or "0"
+        # By default int() refuses a string of more than 4300 digits, leading zeros included. 2^256 - 1,
+        # the largest value of any integer field, has 78 digits, so a longer number is not converted:
+        # 2^256 stands for it, and the caller's range check refuses it.
+        magnitude = int(digits) if len(digits) <= 78 else 1 << 256
+        return -magnitude if value.startswith("-") else magnitude
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BuilderError(f'metadata field "{name}" must be an integer or a string of decimal digits')
     return value
 
 
